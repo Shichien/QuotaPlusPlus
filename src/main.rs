@@ -1,6 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use chrono::Local;
 use directories::UserDirs;
 use serde::Serialize;
 use std::error::Error;
@@ -10,8 +9,11 @@ use std::process::Command;
 use toml_edit::{DocumentMut, Item, Table, value};
 use url::Url;
 
-const PROVIDER_ID: &str = "qpp";
-const BACKUP_DIR: &str = "qpp-backups";
+mod provider_sync;
+
+use provider_sync::ProviderSyncReport;
+
+const PROVIDER_ID: &str = "custom";
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,7 +40,7 @@ fn load_proxy_config() -> Result<ProxyConfig, String> {
 }
 
 #[tauri::command]
-fn save_proxy_config(api_url: String, api_key: String) -> Result<(), String> {
+fn save_proxy_config(api_url: String, api_key: String) -> Result<ProviderSyncReport, String> {
     let codex_home = resolve_codex_home().map_err(display_error)?;
     install_proxy(&codex_home, &api_url, &api_key).map_err(display_error)
 }
@@ -60,22 +62,36 @@ fn resolve_codex_home() -> Result<PathBuf, Box<dyn Error>> {
     Ok(user_dirs.home_dir().join(".codex"))
 }
 
-fn install_proxy(codex_home: &Path, api_url: &str, api_key: &str) -> Result<(), Box<dyn Error>> {
+fn install_proxy(
+    codex_home: &Path,
+    api_url: &str,
+    api_key: &str,
+) -> Result<ProviderSyncReport, Box<dyn Error>> {
     let api_url = normalize_api_url(api_url)?;
     let api_key = validate_api_key(api_key)?;
     let config_path = codex_home.join("config.toml");
 
     fs::create_dir_all(codex_home)?;
     let original = if config_path.exists() {
-        fs::read_to_string(&config_path)?
+        Some(fs::read(&config_path)?)
     } else {
-        String::new()
+        None
     };
-    let updated = build_config(&original, &api_url, api_key)?;
-    backup_config(codex_home, &config_path)?;
-    atomic_write(&config_path, updated.as_bytes())?;
+    let original_text = original
+        .as_deref()
+        .map(std::str::from_utf8)
+        .transpose()
+        .map_err(|error| format!("现有 config.toml 不是 UTF-8：{error}"))?
+        .unwrap_or_default();
+    let updated = build_config(original_text, &api_url, api_key)?;
+    let report = provider_sync::apply_provider_config(
+        codex_home,
+        original.as_deref(),
+        updated.as_bytes(),
+        PROVIDER_ID,
+    )?;
     verify_config(&config_path, &api_url)?;
-    Ok(())
+    Ok(report)
 }
 
 fn read_proxy_config(codex_home: &Path) -> Result<ProxyConfig, Box<dyn Error>> {
@@ -164,63 +180,6 @@ fn build_config(original: &str, api_url: &str, api_key: &str) -> Result<String, 
     Ok(document.to_string())
 }
 
-fn backup_config(codex_home: &Path, config_path: &Path) -> Result<(), Box<dyn Error>> {
-    if !config_path.is_file() {
-        return Ok(());
-    }
-    let timestamp = Local::now().format("%Y%m%d-%H%M%S-%3f").to_string();
-    let backup = codex_home
-        .join(BACKUP_DIR)
-        .join(timestamp)
-        .join("config.toml");
-    fs::create_dir_all(backup.parent().expect("backup parent"))?;
-    fs::copy(config_path, backup)?;
-    Ok(())
-}
-
-fn atomic_write(path: &Path, content: &[u8]) -> Result<(), Box<dyn Error>> {
-    let parent = path.parent().ok_or("配置文件没有父目录")?;
-    fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(".config.toml.qpp-{}.tmp", std::process::id()));
-    fs::write(&temporary, content)?;
-    replace_file(&temporary, path)?;
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn replace_file(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
-    fs::rename(source, destination)?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn replace_file(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MoveFileExW};
-
-    let source = source
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let destination = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let result = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING,
-        )
-    };
-    if result == 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
-}
-
 fn verify_config(config_path: &Path, expected_url: &str) -> Result<(), Box<dyn Error>> {
     let content = fs::read_to_string(config_path)?;
     let document = content.parse::<DocumentMut>()?;
@@ -229,7 +188,7 @@ fn verify_config(config_path: &Path, expected_url: &str) -> Result<(), Box<dyn E
         .and_then(Item::as_table)
         .and_then(|providers| providers.get(PROVIDER_ID))
         .and_then(Item::as_table)
-        .ok_or("写入后的 qpp 提供方不存在")?;
+        .ok_or("写入后的 custom 提供方不存在")?;
     let valid = document.get("model_provider").and_then(Item::as_str) == Some(PROVIDER_ID)
         && provider.get("base_url").and_then(Item::as_str) == Some(expected_url)
         && provider.get("wire_api").and_then(Item::as_str) == Some("responses")
@@ -316,9 +275,9 @@ base_url = "https://existing.example"
             document["model_providers"]["existing"]["name"].as_str(),
             Some("Existing")
         );
-        assert_eq!(document["model_provider"].as_str(), Some("qpp"));
+        assert_eq!(document["model_provider"].as_str(), Some("custom"));
         assert_eq!(
-            document["model_providers"]["qpp"]["experimental_bearer_token"].as_str(),
+            document["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
             Some("secret")
         );
     }

@@ -64,11 +64,11 @@ form.addEventListener("submit", async (event) => {
   saveButton.disabled = true;
   saveButton.textContent = "保存中";
   try {
-    await invoke("save_proxy_config", { apiUrl: apiUrl.value, apiKey: apiKey.value });
+    const result = await invoke("save_proxy_config", { apiUrl: apiUrl.value, apiKey: apiKey.value });
     apiKey.value = "";
     apiKey.type = "password";
     dialog.close();
-    showToast("配置已保存，重启 Codex 后生效");
+    showToast(`配置已保存，已统一 ${result.rolloutFilesUpdated} 个会话文件`);
   } catch (error) {
     showToast(errorMessage(error), true);
   } finally {

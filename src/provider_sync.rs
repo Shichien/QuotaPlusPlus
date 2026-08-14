@@ -1,0 +1,968 @@
+use chrono::Local;
+use fs2::FileExt;
+use rusqlite::backup::Backup;
+use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
+use serde::Serialize;
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::error::Error;
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use toml_edit::{DocumentMut, Item};
+
+const BACKUP_DIR: &str = "qpp-backups";
+const STATE_DB_NAME: &str = "state_5.sqlite";
+const SESSION_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCount {
+    pub provider: String,
+    pub rollout_files: usize,
+    pub sqlite_threads: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSyncReport {
+    pub rollout_files_updated: usize,
+    pub sqlite_rows_updated: usize,
+    pub providers_detected: Vec<ProviderCount>,
+    pub backup_path: String,
+}
+
+#[derive(Debug)]
+struct RolloutChange {
+    path: PathBuf,
+    original_first_line: String,
+    separator: String,
+    updated_first_line: String,
+    original_provider: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupManifest<'a> {
+    version: u8,
+    created_at: String,
+    target_provider: &'a str,
+    config_present: bool,
+    sqlite_path: Option<String>,
+    providers_detected: &'a [ProviderCount],
+    rollout_files: Vec<RolloutBackupEntry<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RolloutBackupEntry<'a> {
+    path: String,
+    original_first_line: &'a str,
+    separator: &'a str,
+    original_provider: &'a str,
+}
+
+pub fn apply_provider_config(
+    codex_home: &Path,
+    original_config: Option<&[u8]>,
+    updated_config: &[u8],
+    target_provider: &str,
+) -> Result<ProviderSyncReport, Box<dyn Error>> {
+    apply_provider_config_with_hook(
+        codex_home,
+        original_config,
+        updated_config,
+        target_provider,
+        || Ok(()),
+    )
+}
+
+fn apply_provider_config_with_hook<F>(
+    codex_home: &Path,
+    original_config: Option<&[u8]>,
+    updated_config: &[u8],
+    target_provider: &str,
+    before_config_write: F,
+) -> Result<ProviderSyncReport, Box<dyn Error>>
+where
+    F: FnOnce() -> Result<(), Box<dyn Error>>,
+{
+    fs::create_dir_all(codex_home)?;
+    let _operation_lock = acquire_operation_lock(codex_home)?;
+    let config_text = original_config
+        .map(std::str::from_utf8)
+        .transpose()
+        .map_err(|error| format!("现有 config.toml 不是 UTF-8：{error}"))?
+        .unwrap_or_default();
+
+    let changes = collect_rollout_changes(codex_home, target_provider)?;
+    let state_db = resolve_state_db(codex_home, config_text)?;
+    if let Some(path) = state_db.as_deref() {
+        assert_sqlite_writable(path)?;
+    }
+    let sqlite_counts = match state_db.as_deref() {
+        Some(path) => read_sqlite_provider_counts(path)?,
+        None => BTreeMap::new(),
+    };
+
+    let providers_detected = merge_provider_counts(&changes, &sqlite_counts);
+    let backup_dir = create_backup(
+        codex_home,
+        original_config,
+        state_db.as_deref(),
+        &changes,
+        &providers_detected,
+        target_provider,
+    )?;
+
+    let config_path = codex_home.join("config.toml");
+    let mut applied_rollouts = Vec::new();
+    let mut sqlite_mutated = false;
+    let mut config_written = false;
+
+    let result = (|| -> Result<ProviderSyncReport, Box<dyn Error>> {
+        for (index, change) in changes.iter().enumerate() {
+            rewrite_first_line(
+                &change.path,
+                &change.original_first_line,
+                &change.separator,
+                &change.updated_first_line,
+                index,
+            )?;
+            applied_rollouts.push(index);
+        }
+
+        let sqlite_rows_updated = match state_db.as_deref() {
+            Some(path) => {
+                sqlite_mutated = sqlite_counts
+                    .iter()
+                    .any(|(provider, count)| provider != target_provider && *count > 0);
+                update_sqlite_provider(path, target_provider)?
+            }
+            None => 0,
+        };
+
+        before_config_write()?;
+        config_written = true;
+        atomic_write(&config_path, updated_config)?;
+        if fs::read(&config_path)? != updated_config {
+            return Err("config.toml 写入后的字节验证失败".into());
+        }
+
+        verify_rollouts(codex_home, target_provider)?;
+        if let Some(path) = state_db.as_deref() {
+            verify_sqlite_provider(path, target_provider)?;
+        }
+
+        Ok(ProviderSyncReport {
+            rollout_files_updated: changes.len(),
+            sqlite_rows_updated,
+            providers_detected,
+            backup_path: backup_dir.to_string_lossy().into_owned(),
+        })
+    })();
+
+    match result {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            let rollback_errors = rollback(
+                &config_path,
+                original_config,
+                &backup_dir,
+                state_db.as_deref(),
+                sqlite_mutated,
+                config_written,
+                &changes,
+                &applied_rollouts,
+            );
+            if rollback_errors.is_empty() {
+                Err(format!("同步失败，所有改动已恢复：{error}").into())
+            } else {
+                Err(format!(
+                    "同步失败且自动恢复不完整：{error}。恢复错误：{}。备份位于 {}",
+                    rollback_errors.join("；"),
+                    backup_dir.display()
+                )
+                .into())
+            }
+        }
+    }
+}
+
+fn acquire_operation_lock(codex_home: &Path) -> Result<File, Box<dyn Error>> {
+    let path = codex_home.join("qpp-sync.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)?;
+    file.try_lock_exclusive()
+        .map_err(|error| -> Box<dyn Error> {
+            format!("另一个 QuotaPlusPlus 同步正在进行，请等待其完成后重试：{error}").into()
+        })?;
+    Ok(file)
+}
+
+fn collect_rollout_changes(
+    codex_home: &Path,
+    target_provider: &str,
+) -> Result<Vec<RolloutChange>, Box<dyn Error>> {
+    let mut paths = Vec::new();
+    for directory in SESSION_DIRS {
+        collect_rollout_paths(&codex_home.join(directory), &mut paths)?;
+    }
+    paths.sort();
+
+    let mut changes = Vec::new();
+    for path in paths {
+        let (first_line, separator) = read_first_line(&path)?;
+        let mut record: Value = serde_json::from_str(&first_line)
+            .map_err(|error| format!("rollout 首行 JSON 无效 {}：{error}", path.display()))?;
+        if record.get("type").and_then(Value::as_str) != Some("session_meta") {
+            return Err(format!("rollout 首行不是 session_meta：{}", path.display()).into());
+        }
+        let payload = record
+            .get_mut("payload")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| format!("rollout 缺少 session_meta.payload：{}", path.display()))?;
+        let original_provider = payload
+            .get("model_provider")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("(missing)")
+            .to_string();
+        if original_provider == target_provider {
+            continue;
+        }
+        payload.insert(
+            "model_provider".to_string(),
+            Value::String(target_provider.to_string()),
+        );
+        changes.push(RolloutChange {
+            path,
+            original_first_line: first_line,
+            separator,
+            updated_first_line: serde_json::to_string(&record)?,
+            original_provider,
+        });
+    }
+    Ok(changes)
+}
+
+fn collect_rollout_paths(root: &Path, paths: &mut Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "会话目录包含符号链接，已停止以避免改写意外路径：{}",
+                entry.path().display()
+            )
+            .into());
+        }
+        if file_type.is_dir() {
+            collect_rollout_paths(&entry.path(), paths)?;
+        } else if file_type.is_file() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("rollout-") && name.ends_with(".jsonl") {
+                paths.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_first_line(path: &Path) -> Result<(String, String), Box<dyn Error>> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut bytes = Vec::new();
+    if reader.read_until(b'\n', &mut bytes)? == 0 {
+        return Err(format!("rollout 是空文件：{}", path.display()).into());
+    }
+    let separator = if bytes.ends_with(b"\r\n") {
+        bytes.truncate(bytes.len() - 2);
+        "\r\n"
+    } else if bytes.ends_with(b"\n") {
+        bytes.truncate(bytes.len() - 1);
+        "\n"
+    } else {
+        ""
+    };
+    let first_line = String::from_utf8(bytes)
+        .map_err(|error| format!("rollout 首行不是 UTF-8 {}：{error}", path.display()))?;
+    Ok((first_line, separator.to_string()))
+}
+
+fn rewrite_first_line(
+    path: &Path,
+    expected_first_line: &str,
+    separator: &str,
+    replacement_first_line: &str,
+    sequence: usize,
+) -> Result<(), Box<dyn Error>> {
+    let source = File::open(path)?;
+    let metadata = source.metadata()?;
+    let mut reader = BufReader::new(source);
+    let mut current_prefix = Vec::new();
+    reader.read_until(b'\n', &mut current_prefix)?;
+    let expected_prefix = format!("{expected_first_line}{separator}").into_bytes();
+    if current_prefix != expected_prefix {
+        return Err(format!("rollout 在同步期间发生变化：{}", path.display()).into());
+    }
+
+    let temporary = path.with_extension(format!("jsonl.qpp-{}-{sequence}.tmp", std::process::id()));
+    let write_result = (|| -> Result<(), Box<dyn Error>> {
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        output.write_all(replacement_first_line.as_bytes())?;
+        output.write_all(separator.as_bytes())?;
+        io::copy(&mut reader, &mut output)?;
+        output.sync_all()?;
+        fs::set_permissions(&temporary, metadata.permissions())?;
+        drop(output);
+        drop(reader);
+        replace_file(&temporary, path)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+fn resolve_state_db(
+    codex_home: &Path,
+    config_text: &str,
+) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    resolve_state_db_with(
+        codex_home,
+        config_text,
+        std::env::var_os("CODEX_SQLITE_HOME"),
+        &std::env::current_dir()?,
+    )
+}
+
+fn resolve_state_db_with(
+    codex_home: &Path,
+    config_text: &str,
+    environment_sqlite_home: Option<OsString>,
+    cwd: &Path,
+) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    let configured = if config_text.trim().is_empty() {
+        None
+    } else {
+        let document = config_text
+            .parse::<DocumentMut>()
+            .map_err(|error| format!("现有 config.toml 解析失败：{error}"))?;
+        document
+            .get("sqlite_home")
+            .and_then(Item::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+    };
+    let explicit = configured
+        .map(OsString::from)
+        .or(environment_sqlite_home.filter(|value| !value.is_empty()));
+    if let Some(value) = explicit {
+        let raw = PathBuf::from(value);
+        let sqlite_home = if raw.is_absolute() {
+            raw
+        } else {
+            cwd.join(raw)
+        };
+        reject_wsl_unc_on_windows(&sqlite_home)?;
+        let database = sqlite_home.join(STATE_DB_NAME);
+        if !database.is_file() {
+            return Err(format!(
+                "配置的 SQLite 目录中不存在 {}：{}",
+                STATE_DB_NAME,
+                sqlite_home.display()
+            )
+            .into());
+        }
+        reject_symlink(&database)?;
+        return Ok(Some(database));
+    }
+
+    for database in [
+        codex_home.join("sqlite").join(STATE_DB_NAME),
+        codex_home.join(STATE_DB_NAME),
+    ] {
+        if database.is_file() {
+            reject_symlink(&database)?;
+            return Ok(Some(database));
+        }
+    }
+    Ok(None)
+}
+
+fn reject_symlink(path: &Path) -> Result<(), Box<dyn Error>> {
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(format!(
+            "状态数据库是符号链接，已停止以避免改写意外路径：{}",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn reject_wsl_unc_on_windows(path: &Path) -> Result<(), Box<dyn Error>> {
+    let normalized = path
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    if normalized.starts_with("\\\\wsl.localhost\\") || normalized.starts_with("\\\\wsl$\\") {
+        return Err(format!("Windows 不能安全改写 WSL 中的 SQLite：{}", path.display()).into());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn reject_wsl_unc_on_windows(_path: &Path) -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+
+fn open_state_db(path: &Path) -> Result<Connection, Box<dyn Error>> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.busy_timeout(Duration::from_secs(2))?;
+    ensure_threads_provider_column(&connection)?;
+    Ok(connection)
+}
+
+fn ensure_threads_provider_column(connection: &Connection) -> Result<(), Box<dyn Error>> {
+    let table_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !table_exists {
+        return Err("state_5.sqlite 缺少 threads 表".into());
+    }
+    let mut statement = connection.prepare("PRAGMA table_info(threads)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        if column? == "model_provider" {
+            return Ok(());
+        }
+    }
+    Err("state_5.sqlite 的 threads 表缺少 model_provider 字段".into())
+}
+
+fn read_sqlite_provider_counts(path: &Path) -> Result<BTreeMap<String, usize>, Box<dyn Error>> {
+    let connection = open_state_db(path)?;
+    let mut statement = connection.prepare(
+        "SELECT CASE WHEN model_provider IS NULL OR model_provider = '' THEN '(missing)' ELSE model_provider END, COUNT(*) FROM threads GROUP BY 1 ORDER BY 1",
+    )?;
+    let mut counts = BTreeMap::new();
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    for row in rows {
+        let (provider, count) = row?;
+        counts.insert(provider, usize::try_from(count)?);
+    }
+    Ok(counts)
+}
+
+fn assert_sqlite_writable(path: &Path) -> Result<(), Box<dyn Error>> {
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        let connection = open_state_db(path)?;
+        connection.execute_batch("BEGIN IMMEDIATE; ROLLBACK;")?;
+        Ok(())
+    })();
+    result.map_err(|error| {
+        format!("state_5.sqlite 正在使用或不可写，请关闭 Codex 后重试：{error}").into()
+    })
+}
+
+fn update_sqlite_provider(path: &Path, target_provider: &str) -> Result<usize, Box<dyn Error>> {
+    let mut connection = open_state_db(path)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let rows = transaction.execute(
+        "UPDATE threads SET model_provider = ?1 WHERE COALESCE(model_provider, '') <> ?1",
+        params![target_provider],
+    )?;
+    transaction.commit()?;
+    Ok(rows)
+}
+
+fn verify_sqlite_provider(path: &Path, target_provider: &str) -> Result<(), Box<dyn Error>> {
+    let connection = open_state_db(path)?;
+    let remaining: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM threads WHERE COALESCE(model_provider, '') <> ?1",
+        params![target_provider],
+        |row| row.get(0),
+    )?;
+    if remaining != 0 {
+        return Err(
+            format!("SQLite 验证失败，仍有 {remaining} 个任务不属于 {target_provider}").into(),
+        );
+    }
+    Ok(())
+}
+
+fn merge_provider_counts(
+    changes: &[RolloutChange],
+    sqlite_counts: &BTreeMap<String, usize>,
+) -> Vec<ProviderCount> {
+    let mut combined = BTreeMap::<String, (usize, usize)>::new();
+    for change in changes {
+        combined
+            .entry(change.original_provider.clone())
+            .or_default()
+            .0 += 1;
+    }
+    for (provider, count) in sqlite_counts {
+        combined.entry(provider.clone()).or_default().1 += count;
+    }
+    combined
+        .into_iter()
+        .map(
+            |(provider, (rollout_files, sqlite_threads))| ProviderCount {
+                provider,
+                rollout_files,
+                sqlite_threads,
+            },
+        )
+        .collect()
+}
+
+fn create_backup(
+    codex_home: &Path,
+    original_config: Option<&[u8]>,
+    state_db: Option<&Path>,
+    changes: &[RolloutChange],
+    providers_detected: &[ProviderCount],
+    target_provider: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let timestamp = Local::now().format("%Y%m%d-%H%M%S-%3f").to_string();
+    let backup_dir = codex_home.join(BACKUP_DIR).join(timestamp);
+    fs::create_dir_all(&backup_dir)?;
+
+    if let Some(config) = original_config {
+        write_new_file(&backup_dir.join("config.toml"), config)?;
+    }
+    if let Some(path) = state_db {
+        let sqlite_backup = backup_dir.join("sqlite").join(STATE_DB_NAME);
+        fs::create_dir_all(sqlite_backup.parent().expect("sqlite backup parent"))?;
+        backup_sqlite(path, &sqlite_backup)?;
+    }
+
+    let manifest = BackupManifest {
+        version: 1,
+        created_at: Local::now().to_rfc3339(),
+        target_provider,
+        config_present: original_config.is_some(),
+        sqlite_path: state_db.map(|path| path.to_string_lossy().into_owned()),
+        providers_detected,
+        rollout_files: changes
+            .iter()
+            .map(|change| RolloutBackupEntry {
+                path: change.path.to_string_lossy().into_owned(),
+                original_first_line: &change.original_first_line,
+                separator: &change.separator,
+                original_provider: &change.original_provider,
+            })
+            .collect(),
+    };
+    write_new_file(
+        &backup_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?.as_slice(),
+    )?;
+    Ok(backup_dir)
+}
+
+fn backup_sqlite(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
+    let source_connection = open_state_db(source)?;
+    let mut destination_connection = Connection::open(destination)?;
+    let backup = Backup::new(&source_connection, &mut destination_connection)?;
+    backup.run_to_completion(16, Duration::from_millis(20), None)?;
+    Ok(())
+}
+
+fn restore_sqlite(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
+    let source_connection = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut destination_connection = Connection::open_with_flags(
+        destination,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    destination_connection.busy_timeout(Duration::from_secs(2))?;
+    let backup = Backup::new(&source_connection, &mut destination_connection)?;
+    backup.run_to_completion(16, Duration::from_millis(20), None)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rollback(
+    config_path: &Path,
+    original_config: Option<&[u8]>,
+    backup_dir: &Path,
+    state_db: Option<&Path>,
+    sqlite_mutated: bool,
+    config_written: bool,
+    changes: &[RolloutChange],
+    applied_rollouts: &[usize],
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    if config_written {
+        let result = match original_config {
+            Some(config) => atomic_write(config_path, config),
+            None => fs::remove_file(config_path).map_err(Into::into),
+        };
+        if let Err(error) = result {
+            errors.push(format!("恢复 config.toml 失败：{error}"));
+        }
+    }
+    if sqlite_mutated && let Some(destination) = state_db {
+        let source = backup_dir.join("sqlite").join(STATE_DB_NAME);
+        if let Err(error) = restore_sqlite(&source, destination) {
+            errors.push(format!("恢复 SQLite 失败：{error}"));
+        }
+    }
+    for index in applied_rollouts.iter().rev() {
+        let change = &changes[*index];
+        if let Err(error) = rewrite_first_line(
+            &change.path,
+            &change.updated_first_line,
+            &change.separator,
+            &change.original_first_line,
+            *index,
+        ) {
+            errors.push(format!(
+                "恢复 rollout 失败 {}：{error}",
+                change.path.display()
+            ));
+        }
+    }
+    errors
+}
+
+fn verify_rollouts(codex_home: &Path, target_provider: &str) -> Result<(), Box<dyn Error>> {
+    let remaining = collect_rollout_changes(codex_home, target_provider)?;
+    if !remaining.is_empty() {
+        return Err(format!(
+            "rollout 验证失败，仍有 {} 个文件不属于 {target_provider}",
+            remaining.len()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn write_new_file(path: &Path, content: &[u8]) -> Result<(), Box<dyn Error>> {
+    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    file.write_all(content)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn atomic_write(path: &Path, content: &[u8]) -> Result<(), Box<dyn Error>> {
+    let parent = path.parent().ok_or("文件没有父目录")?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(
+        ".{}.qpp-{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file"),
+        std::process::id()
+    ));
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        replace_file(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
+    fs::rename(source, destination)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MoveFileExW};
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING,
+        )
+    };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::params;
+    use tempfile::tempdir;
+
+    fn create_rollout(path: &Path, provider: Option<&str>, body: &str) {
+        fs::create_dir_all(path.parent().expect("rollout parent")).expect("create rollout parent");
+        let mut payload = serde_json::json!({"id": "thread-id", "cwd": "C:/fixture"});
+        if let Some(provider) = provider {
+            payload["model_provider"] = Value::String(provider.to_string());
+        }
+        let header = serde_json::json!({"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta", "payload": payload});
+        fs::write(
+            path,
+            format!(
+                "{}\n{body}\n",
+                serde_json::to_string(&header).expect("serialize header")
+            ),
+        )
+        .expect("write rollout");
+    }
+
+    fn create_state_db(path: &Path, providers: &[Option<&str>]) {
+        fs::create_dir_all(path.parent().expect("db parent")).expect("create db parent");
+        let connection = Connection::open(path).expect("open fixture db");
+        connection.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT, title TEXT, updated_at INTEGER);").expect("create threads");
+        for (index, provider) in providers.iter().enumerate() {
+            connection.execute(
+                "INSERT INTO threads (id, model_provider, title, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                params![format!("thread-{index}"), provider, format!("title-{index}"), 1000 + index as i64],
+            ).expect("insert thread");
+        }
+    }
+
+    #[test]
+    fn syncs_every_detected_provider_and_preserves_conversation_data() {
+        let directory = tempdir().expect("tempdir");
+        let codex_home = directory.path();
+        let first = codex_home.join("sessions/2026/01/rollout-one.jsonl");
+        let second = codex_home.join("sessions/2026/01/rollout-two.jsonl");
+        let archived = codex_home.join("archived_sessions/rollout-three.jsonl");
+        create_rollout(
+            &first,
+            Some("openai"),
+            r#"{"type":"event_msg","payload":{"message":"first"}}"#,
+        );
+        create_rollout(
+            &second,
+            Some("qpp"),
+            r#"{"type":"event_msg","payload":{"message":"second"}}"#,
+        );
+        create_rollout(
+            &archived,
+            None,
+            r#"{"type":"event_msg","payload":{"message":"archived"}}"#,
+        );
+        let state_db = codex_home.join("sqlite/state_5.sqlite");
+        create_state_db(
+            &state_db,
+            &[Some("openai"), Some("another"), None, Some("custom")],
+        );
+        let original = b"model = \"gpt-test\"\n";
+        fs::write(codex_home.join("config.toml"), original).expect("write config");
+        let updated = b"model_provider = \"custom\"\n";
+
+        let report =
+            apply_provider_config(codex_home, Some(original), updated, "custom").expect("sync");
+
+        assert_eq!(report.rollout_files_updated, 3);
+        assert_eq!(report.sqlite_rows_updated, 3);
+        assert!(
+            report
+                .providers_detected
+                .iter()
+                .any(|entry| entry.provider == "openai")
+        );
+        for path in [&first, &second, &archived] {
+            let content = fs::read_to_string(path).expect("read rollout");
+            let first_line = content.lines().next().expect("first line");
+            let record: Value = serde_json::from_str(first_line).expect("parse rollout");
+            assert_eq!(record["payload"]["model_provider"], "custom");
+        }
+        assert!(
+            fs::read_to_string(first)
+                .expect("read body")
+                .contains("first")
+        );
+        assert!(
+            fs::read_to_string(archived)
+                .expect("read archived body")
+                .contains("archived")
+        );
+        let connection = Connection::open(state_db).expect("open synced db");
+        let remaining: i64 = connection.query_row("SELECT COUNT(*) FROM threads WHERE model_provider <> 'custom' OR model_provider IS NULL", [], |row| row.get(0)).expect("count remaining");
+        assert_eq!(remaining, 0);
+        let preserved: (String, i64) = connection
+            .query_row(
+                "SELECT title, updated_at FROM threads WHERE id = 'thread-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read preserved fields");
+        assert_eq!(preserved, ("title-1".to_string(), 1001));
+        assert!(Path::new(&report.backup_path).join("config.toml").is_file());
+        assert!(
+            Path::new(&report.backup_path)
+                .join("manifest.json")
+                .is_file()
+        );
+        assert!(
+            Path::new(&report.backup_path)
+                .join("sqlite/state_5.sqlite")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn locked_sqlite_stops_before_any_file_is_changed() {
+        let directory = tempdir().expect("tempdir");
+        let codex_home = directory.path();
+        let rollout = codex_home.join("sessions/rollout-locked.jsonl");
+        create_rollout(
+            &rollout,
+            Some("openai"),
+            r#"{"type":"event_msg","payload":{"message":"unchanged"}}"#,
+        );
+        let original_rollout = fs::read(&rollout).expect("read original rollout");
+        let state_db = codex_home.join("sqlite/state_5.sqlite");
+        create_state_db(&state_db, &[Some("openai")]);
+        let lock = Connection::open(&state_db).expect("open lock connection");
+        lock.execute_batch("BEGIN EXCLUSIVE")
+            .expect("lock database");
+
+        let error =
+            apply_provider_config(codex_home, None, b"model_provider = \"custom\"\n", "custom")
+                .expect_err("sync should fail");
+
+        assert!(error.to_string().contains("关闭 Codex"), "{error}");
+        assert_eq!(
+            fs::read(rollout).expect("read rollout after failure"),
+            original_rollout
+        );
+        assert!(!codex_home.join("config.toml").exists());
+        lock.execute_batch("ROLLBACK").expect("unlock database");
+    }
+
+    #[test]
+    fn explicit_sqlite_home_does_not_fall_back() {
+        let directory = tempdir().expect("tempdir");
+        let fallback = directory.path().join("sqlite/state_5.sqlite");
+        create_state_db(&fallback, &[Some("openai")]);
+        let missing = directory.path().join("configured");
+        let config = format!("sqlite_home = {:?}\n", missing.to_string_lossy());
+
+        let error = resolve_state_db_with(directory.path(), &config, None, directory.path())
+            .expect_err("missing configured db should fail");
+
+        assert!(error.to_string().contains("不存在"));
+    }
+
+    #[test]
+    fn final_config_failure_restores_rollout_and_sqlite() {
+        let directory = tempdir().expect("tempdir");
+        let codex_home = directory.path();
+        let rollout = codex_home.join("sessions/rollout-rollback.jsonl");
+        create_rollout(
+            &rollout,
+            Some("openai"),
+            r#"{"type":"event_msg","payload":{"message":"keep me"}}"#,
+        );
+        let original_rollout = fs::read(&rollout).expect("read original rollout");
+        let state_db = codex_home.join("sqlite/state_5.sqlite");
+        create_state_db(&state_db, &[Some("openai")]);
+        let original_config = b"model = \"gpt-test\"\n";
+        let config_path = codex_home.join("config.toml");
+        fs::write(&config_path, original_config).expect("write original config");
+
+        let error = apply_provider_config_with_hook(
+            codex_home,
+            Some(original_config),
+            b"model_provider = \"custom\"\n",
+            "custom",
+            || Err("injected config write failure".into()),
+        )
+        .expect_err("config write should fail");
+
+        assert!(error.to_string().contains("所有改动已恢复"), "{error}");
+        assert_eq!(
+            fs::read(&rollout).expect("read restored rollout"),
+            original_rollout
+        );
+        assert_eq!(
+            fs::read(&config_path).expect("read restored config"),
+            original_config
+        );
+        let connection = Connection::open(state_db).expect("open restored db");
+        let provider: String = connection
+            .query_row(
+                "SELECT model_provider FROM threads WHERE id = 'thread-0'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read restored provider");
+        assert_eq!(provider, "openai");
+    }
+
+    #[test]
+    fn concurrent_sync_is_rejected_before_mutation() {
+        let directory = tempdir().expect("tempdir");
+        let codex_home = directory.path();
+        let rollout = codex_home.join("sessions/rollout-concurrent.jsonl");
+        create_rollout(
+            &rollout,
+            Some("openai"),
+            r#"{"type":"event_msg","payload":{"message":"unchanged"}}"#,
+        );
+        let original_rollout = fs::read(&rollout).expect("read original rollout");
+        let lock = acquire_operation_lock(codex_home).expect("acquire first lock");
+
+        let error =
+            apply_provider_config(codex_home, None, b"model_provider = \"custom\"\n", "custom")
+                .expect_err("second sync should fail");
+
+        assert!(
+            error.to_string().contains("另一个 QuotaPlusPlus"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(rollout).expect("read rollout after rejection"),
+            original_rollout
+        );
+        assert!(!codex_home.join("config.toml").exists());
+        drop(lock);
+    }
+}
