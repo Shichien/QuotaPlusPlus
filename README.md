@@ -23,9 +23,18 @@ experimental_bearer_token = "API_KEY"
 
 程序不会读取或修改 Codex 登录凭据。保存 API 配置时，程序会扫描普通会话、归档会话和 Codex SQLite 状态数据库，把其中所有任务的提供方统一为 `custom`。修改前会把配置、rollout 元数据和 SQLite 备份到 `~/.codex/qpp-backups/`；其他配置和提供方定义保持不变，失败时自动恢复。
 
-## 一行安装
+## 下载和安装
 
-发布到 GitHub 后，将命令中的 `OWNER` 换成仓库所属账号：
+发布页会生成以下平台成品：
+
+| 平台 | 成品 |
+| --- | --- |
+| Windows x64 | `qpp-windows-x64.exe` |
+| Apple 芯片 Mac | `qpp-macos-arm64.dmg` |
+| Intel Mac | `qpp-macos-x64.dmg` |
+| Linux x64 | `qpp-linux-x64.AppImage`、`qpp-linux-x64.deb` |
+
+### Windows
 
 ```powershell
 irm https://github.com/Shichien/QuotaPlusPlus/releases/latest/download/install.ps1 | iex
@@ -49,10 +58,25 @@ notepad install.ps1
 .\install.ps1
 ```
 
-## 构建
+### macOS
 
-```text
-cargo build --release
+Apple 芯片 Mac 下载 `qpp-macos-arm64.dmg`，Intel Mac 下载 `qpp-macos-x64.dmg`，打开后把 QuotaPlusPlus 拖入应用程序目录。
+
+当前发布包没有使用 Apple 开发者证书签名。首次启动时，需要在访达中右键点击 QuotaPlusPlus 并选择打开。
+
+### Linux
+
+Debian、Ubuntu 及其衍生系统可以安装 `qpp-linux-x64.deb`。其他常见 x86_64 桌面发行版可以下载 `qpp-linux-x64.AppImage`，赋予执行权限后运行：
+
+```bash
+chmod +x qpp-linux-x64.AppImage
+./qpp-linux-x64.AppImage
 ```
 
-产物名为 `qpp`，Windows 上是 `qpp.exe`。
+## 构建
+
+```bash
+npx @tauri-apps/cli@2 build
+```
+
+GitHub Actions 会分别在 Windows、Intel Mac、Apple 芯片 Mac 和 Ubuntu 原生运行环境中构建。macOS 生成 DMG，Linux 生成 AppImage 和 DEB，Windows 继续生成现有的一键安装成品。

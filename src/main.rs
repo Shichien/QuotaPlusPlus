@@ -234,10 +234,13 @@ fn launch_codex_login() -> Result<(), Box<dyn Error>> {
 #[cfg(all(unix, not(target_os = "macos")))]
 fn launch_codex_login() -> Result<(), Box<dyn Error>> {
     let terminals: [(&str, &[&str]); 4] = [
-        ("x-terminal-emulator", &["-e", "codex login --device-auth"]),
         ("gnome-terminal", &["--", "codex", "login", "--device-auth"]),
         ("konsole", &["-e", "codex", "login", "--device-auth"]),
-        ("xterm", &["-e", "codex login --device-auth"]),
+        (
+            "x-terminal-emulator",
+            &["-e", "codex", "login", "--device-auth"],
+        ),
+        ("xterm", &["-e", "codex", "login", "--device-auth"]),
     ];
     for (terminal, args) in terminals {
         if Command::new(terminal).args(args).spawn().is_ok() {

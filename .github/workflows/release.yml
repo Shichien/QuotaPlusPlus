@@ -1,4 +1,4 @@
-name: Build QuotaPlusPlus
+name: Build and release QuotaPlusPlus
 
 on:
   workflow_dispatch:
@@ -12,69 +12,111 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: windows-latest
+          - platform: windows-latest
             artifact: qpp-windows-x64
-            binary: target/release/qpp.exe
-            extension: .exe
-          - os: macos-15-intel
+            target: ""
+            tauri_args: ""
+          - platform: macos-15-intel
             artifact: qpp-macos-x64
-            binary: target/release/qpp
-            extension: ""
-          - os: macos-14
+            target: x86_64-apple-darwin
+            tauri_args: --target x86_64-apple-darwin --bundles dmg
+          - platform: macos-14
             artifact: qpp-macos-arm64
-            binary: target/release/qpp
-            extension: ""
-          - os: ubuntu-latest
+            target: aarch64-apple-darwin
+            tauri_args: --target aarch64-apple-darwin --bundles dmg
+          - platform: ubuntu-22.04
             artifact: qpp-linux-x64
-            binary: target/release/qpp
-            extension: ""
-    runs-on: ${{ matrix.os }}
+            target: ""
+            tauri_args: --bundles appimage,deb
+
+    runs-on: ${{ matrix.platform }}
+
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
       - name: Install Linux desktop dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libgtk-3-dev librsvg2-dev
-          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev \
-            || sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.0-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --locked
-      - run: cargo build --release --locked
-      - name: Name release file
-        shell: bash
-        run: cp "${{ matrix.binary }}" "${{ matrix.artifact }}${{ matrix.extension }}"
-      - name: Prepare Windows one-line installer
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build Windows executable
+        if: runner.os == 'Windows'
+        run: cargo build --release --locked
+
+      - name: Build macOS and Linux bundles
+        if: runner.os != 'Windows'
+        uses: tauri-apps/tauri-action@v1
+        with:
+          args: ${{ matrix.tauri_args }}
+
+      - name: Prepare Windows release assets
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Path 'release-assets' -Force | Out-Null
+          Copy-Item -LiteralPath 'target/release/qpp.exe' -Destination 'release-assets/qpp-windows-x64.exe'
           $repository = '${{ github.repository }}'
           $install = (Get-Content -LiteralPath 'scripts/install.ps1' -Raw).Replace('__QPP_REPOSITORY__', $repository)
-          Set-Content -LiteralPath 'install.ps1' -Value $install -Encoding utf8NoBOM -NoNewline
-          Copy-Item -LiteralPath 'scripts/uninstall.ps1' -Destination 'uninstall.ps1'
-      - uses: actions/upload-artifact@v4
-        if: runner.os != 'Windows'
+          Set-Content -LiteralPath 'release-assets/install.ps1' -Value $install -Encoding utf8NoBOM -NoNewline
+          Copy-Item -LiteralPath 'scripts/uninstall.ps1' -Destination 'release-assets/uninstall.ps1'
+
+      - name: Prepare Intel macOS release asset
+        if: matrix.artifact == 'qpp-macos-x64'
+        run: |
+          mkdir -p release-assets
+          cp target/x86_64-apple-darwin/release/bundle/dmg/*.dmg release-assets/qpp-macos-x64.dmg
+
+      - name: Prepare Apple silicon macOS release asset
+        if: matrix.artifact == 'qpp-macos-arm64'
+        run: |
+          mkdir -p release-assets
+          cp target/aarch64-apple-darwin/release/bundle/dmg/*.dmg release-assets/qpp-macos-arm64.dmg
+
+      - name: Prepare Linux release assets
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p release-assets
+          cp target/release/bundle/appimage/*.AppImage release-assets/qpp-linux-x64.AppImage
+          cp target/release/bundle/deb/*.deb release-assets/qpp-linux-x64.deb
+
+      - name: Upload platform assets
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}${{ matrix.extension }}
-      - uses: actions/upload-artifact@v4
-        if: runner.os == 'Windows'
+          path: release-assets/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download platform assets
+        uses: actions/download-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: |
-            ${{ matrix.artifact }}${{ matrix.extension }}
-            install.ps1
-            uninstall.ps1
-      - if: startsWith(github.ref, 'refs/tags/') && runner.os != 'Windows'
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.artifact }}${{ matrix.extension }}
-      - if: startsWith(github.ref, 'refs/tags/') && runner.os == 'Windows'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            ${{ matrix.artifact }}${{ matrix.extension }}
-            install.ps1
-            uninstall.ps1
+          files: release-assets/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
