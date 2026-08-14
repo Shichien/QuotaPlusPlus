@@ -65,6 +65,7 @@ jobs:
         uses: tauri-apps/tauri-action@v1
         with:
           args: ${{ matrix.tauri_args }}
+          retryAttempts: 2
 
       - name: Prepare Windows release assets
         if: runner.os == 'Windows'
