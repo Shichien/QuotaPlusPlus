@@ -1,0 +1,80 @@
+name: Build QuotaPlusPlus
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: qpp-windows-x64
+            binary: target/release/qpp.exe
+            extension: .exe
+          - os: macos-15-intel
+            artifact: qpp-macos-x64
+            binary: target/release/qpp
+            extension: ""
+          - os: macos-14
+            artifact: qpp-macos-arm64
+            binary: target/release/qpp
+            extension: ""
+          - os: ubuntu-latest
+            artifact: qpp-linux-x64
+            binary: target/release/qpp
+            extension: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgtk-3-dev librsvg2-dev
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev \
+            || sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.0-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Name release file
+        shell: bash
+        run: cp "${{ matrix.binary }}" "${{ matrix.artifact }}${{ matrix.extension }}"
+      - name: Prepare Windows one-line installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $repository = '${{ github.repository }}'
+          $install = (Get-Content -LiteralPath 'scripts/install.ps1' -Raw).Replace('__QPP_REPOSITORY__', $repository)
+          Set-Content -LiteralPath 'install.ps1' -Value $install -Encoding utf8NoBOM -NoNewline
+          Copy-Item -LiteralPath 'scripts/uninstall.ps1' -Destination 'uninstall.ps1'
+      - uses: actions/upload-artifact@v4
+        if: runner.os != 'Windows'
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}${{ matrix.extension }}
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}${{ matrix.extension }}
+            install.ps1
+            uninstall.ps1
+      - if: startsWith(github.ref, 'refs/tags/') && runner.os != 'Windows'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}${{ matrix.extension }}
+      - if: startsWith(github.ref, 'refs/tags/') && runner.os == 'Windows'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ matrix.artifact }}${{ matrix.extension }}
+            install.ps1
+            uninstall.ps1

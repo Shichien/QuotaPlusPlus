@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
+    <title>QuotaPlusPlus</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="brand" aria-label="QuotaPlusPlus">
+        <div class="brand-mark" aria-hidden="true">Q++</div>
+        <h1>QuotaPlusPlus</h1>
+      </header>
+      <section class="actions" aria-label="Codex 配置">
+        <button class="action" id="login-button" type="button">
+          <span class="action-icon action-icon-login" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3"/></svg>
+          </span>
+          <span>官方登录</span>
+          <svg class="chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+        </button>
+        <button class="action" id="config-button" type="button">
+          <span class="action-icon action-icon-api" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path d="M12 3a3 3 0 0 0-3 3v3H7a2 2 0 0 0-2 2v7a3 3 0 0 0 3 3h8a3 3 0 0 0 3-3v-7a2 2 0 0 0-2-2h-2V6a3 3 0 0 0-3-3Z"/><path d="M9 9V6a3 3 0 0 1 6 0v3"/></svg>
+          </span>
+          <span>API 配置</span>
+          <svg class="chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+        </button>
+      </section>
+    </main>
+    <dialog id="config-dialog">
+      <form id="config-form">
+        <div class="dialog-head">
+          <h2>API 配置</h2>
+          <button class="icon-button" id="close-dialog" type="button" aria-label="关闭">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+          </button>
+        </div>
+        <label for="api-url">API URL</label>
+        <input id="api-url" name="apiUrl" type="url" inputmode="url" autocomplete="url" placeholder="https://api.example.com/v1" required />
+        <label for="api-key">API Key</label>
+        <div class="key-field">
+          <input id="api-key" name="apiKey" type="password" autocomplete="off" placeholder="输入 API Key" required />
+          <button class="reveal-button" id="reveal-key" type="button" aria-label="显示 API Key">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>
+          </button>
+        </div>
+        <button class="primary-button" id="save-button" type="submit">保存</button>
+      </form>
+    </dialog>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>

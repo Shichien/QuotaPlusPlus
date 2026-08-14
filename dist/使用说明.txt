@@ -1,0 +1,14 @@
+QuotaPlusPlus
+
+运行 qpp.exe。
+
+官方登录：启动 Codex 官方设备码登录。
+API 配置：填写 API URL 和 API Key，保存后重启 Codex。
+
+API URL 必须支持 OpenAI Responses API 及流式工具调用事件。
+程序不会读取或修改 Codex 的官方登录凭据。
+
+发布到 GitHub 后可以一行安装：
+irm https://github.com/OWNER/QuotaPlusPlus/releases/latest/download/install.ps1 | iex
+
+其中 OWNER 替换为 GitHub 仓库所属账号。重复执行同一命令即可升级。
