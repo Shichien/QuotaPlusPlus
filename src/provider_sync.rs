@@ -9,6 +9,8 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use toml_edit::{DocumentMut, Item};
@@ -50,9 +52,18 @@ struct BackupManifest<'a> {
     created_at: String,
     target_provider: &'a str,
     config_present: bool,
+    auth_present: bool,
     sqlite_path: Option<String>,
     providers_detected: &'a [ProviderCount],
     rollout_files: Vec<RolloutBackupEntry<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub enum AuthUpdate<'a> {
+    #[cfg(test)]
+    Keep,
+    Replace(&'a [u8]),
+    Remove,
 }
 
 #[derive(Serialize)]
@@ -64,7 +75,8 @@ struct RolloutBackupEntry<'a> {
     original_provider: &'a str,
 }
 
-pub fn apply_provider_config(
+#[cfg(test)]
+fn apply_provider_config(
     codex_home: &Path,
     original_config: Option<&[u8]>,
     updated_config: &[u8],
@@ -75,6 +87,24 @@ pub fn apply_provider_config(
         original_config,
         updated_config,
         target_provider,
+        AuthUpdate::Keep,
+        || Ok(()),
+    )
+}
+
+pub fn apply_provider_state(
+    codex_home: &Path,
+    original_config: Option<&[u8]>,
+    updated_config: &[u8],
+    target_provider: &str,
+    auth_update: AuthUpdate<'_>,
+) -> Result<ProviderSyncReport, Box<dyn Error>> {
+    apply_provider_config_with_hook(
+        codex_home,
+        original_config,
+        updated_config,
+        target_provider,
+        auth_update,
         || Ok(()),
     )
 }
@@ -84,6 +114,7 @@ fn apply_provider_config_with_hook<F>(
     original_config: Option<&[u8]>,
     updated_config: &[u8],
     target_provider: &str,
+    auth_update: AuthUpdate<'_>,
     before_config_write: F,
 ) -> Result<ProviderSyncReport, Box<dyn Error>>
 where
@@ -91,6 +122,12 @@ where
 {
     fs::create_dir_all(codex_home)?;
     let _operation_lock = acquire_operation_lock(codex_home)?;
+    let auth_path = codex_home.join("auth.json");
+    let original_auth = match fs::read(&auth_path) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
     let config_text = original_config
         .map(std::str::from_utf8)
         .transpose()
@@ -111,6 +148,7 @@ where
     let backup_dir = create_backup(
         codex_home,
         original_config,
+        original_auth.as_deref(),
         state_db.as_deref(),
         &changes,
         &providers_detected,
@@ -121,6 +159,7 @@ where
     let mut applied_rollouts = Vec::new();
     let mut sqlite_mutated = false;
     let mut config_written = false;
+    let mut auth_mutated = false;
 
     let result = (|| -> Result<ProviderSyncReport, Box<dyn Error>> {
         for (index, change) in changes.iter().enumerate() {
@@ -156,6 +195,29 @@ where
             verify_sqlite_provider(path, target_provider)?;
         }
 
+        match auth_update {
+            #[cfg(test)]
+            AuthUpdate::Keep => {}
+            AuthUpdate::Replace(auth) => {
+                auth_mutated = original_auth.as_deref() != Some(auth);
+                if auth_mutated {
+                    atomic_write(&auth_path, auth)?;
+                }
+                if fs::read(&auth_path)? != auth {
+                    return Err("auth.json 写入后的字节验证失败".into());
+                }
+            }
+            AuthUpdate::Remove => {
+                auth_mutated = original_auth.is_some();
+                if auth_mutated {
+                    fs::remove_file(&auth_path)?;
+                }
+                if auth_path.exists() {
+                    return Err("auth.json 移除后的验证未通过".into());
+                }
+            }
+        }
+
         Ok(ProviderSyncReport {
             rollout_files_updated: changes.len(),
             sqlite_rows_updated,
@@ -170,10 +232,13 @@ where
             let rollback_errors = rollback(
                 &config_path,
                 original_config,
+                &auth_path,
+                original_auth.as_deref(),
                 &backup_dir,
                 state_db.as_deref(),
                 sqlite_mutated,
                 config_written,
+                auth_mutated,
                 &changes,
                 &applied_rollouts,
             );
@@ -544,6 +609,7 @@ fn merge_provider_counts(
 fn create_backup(
     codex_home: &Path,
     original_config: Option<&[u8]>,
+    original_auth: Option<&[u8]>,
     state_db: Option<&Path>,
     changes: &[RolloutChange],
     providers_detected: &[ProviderCount],
@@ -552,9 +618,14 @@ fn create_backup(
     let timestamp = Local::now().format("%Y%m%d-%H%M%S-%3f").to_string();
     let backup_dir = codex_home.join(BACKUP_DIR).join(timestamp);
     fs::create_dir_all(&backup_dir)?;
+    #[cfg(unix)]
+    fs::set_permissions(&backup_dir, fs::Permissions::from_mode(0o700))?;
 
     if let Some(config) = original_config {
         write_new_file(&backup_dir.join("config.toml"), config)?;
+    }
+    if let Some(auth) = original_auth {
+        write_new_file(&backup_dir.join("auth.json"), auth)?;
     }
     if let Some(path) = state_db {
         let sqlite_backup = backup_dir.join("sqlite").join(STATE_DB_NAME);
@@ -563,10 +634,11 @@ fn create_backup(
     }
 
     let manifest = BackupManifest {
-        version: 1,
+        version: 2,
         created_at: Local::now().to_rfc3339(),
         target_provider,
         config_present: original_config.is_some(),
+        auth_present: original_auth.is_some(),
         sqlite_path: state_db.map(|path| path.to_string_lossy().into_owned()),
         providers_detected,
         rollout_files: changes
@@ -610,19 +682,25 @@ fn restore_sqlite(source: &Path, destination: &Path) -> Result<(), Box<dyn Error
 fn rollback(
     config_path: &Path,
     original_config: Option<&[u8]>,
+    auth_path: &Path,
+    original_auth: Option<&[u8]>,
     backup_dir: &Path,
     state_db: Option<&Path>,
     sqlite_mutated: bool,
     config_written: bool,
+    auth_mutated: bool,
     changes: &[RolloutChange],
     applied_rollouts: &[usize],
 ) -> Vec<String> {
     let mut errors = Vec::new();
+    if auth_mutated {
+        let result = restore_optional_file(auth_path, original_auth);
+        if let Err(error) = result {
+            errors.push(format!("恢复 auth.json 失败：{error}"));
+        }
+    }
     if config_written {
-        let result = match original_config {
-            Some(config) => atomic_write(config_path, config),
-            None => fs::remove_file(config_path).map_err(Into::into),
-        };
+        let result = restore_optional_file(config_path, original_config);
         if let Err(error) = result {
             errors.push(format!("恢复 config.toml 失败：{error}"));
         }
@@ -651,6 +729,17 @@ fn rollback(
     errors
 }
 
+fn restore_optional_file(path: &Path, content: Option<&[u8]>) -> Result<(), Box<dyn Error>> {
+    match content {
+        Some(content) => atomic_write(path, content),
+        None => match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        },
+    }
+}
+
 fn verify_rollouts(codex_home: &Path, target_provider: &str) -> Result<(), Box<dyn Error>> {
     let remaining = collect_rollout_changes(codex_home, target_provider)?;
     if !remaining.is_empty() {
@@ -664,7 +753,11 @@ fn verify_rollouts(codex_home: &Path, target_provider: &str) -> Result<(), Box<d
 }
 
 fn write_new_file(path: &Path, content: &[u8]) -> Result<(), Box<dyn Error>> {
-    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path)?;
     file.write_all(content)?;
     file.sync_all()?;
     Ok(())
@@ -681,10 +774,11 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<(), Box<dyn Error>> {
         std::process::id()
     ));
     let result = (|| -> Result<(), Box<dyn Error>> {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary)?;
         file.write_all(content)?;
         file.sync_all()?;
         replace_file(&temporary, path)?;
@@ -913,6 +1007,7 @@ mod tests {
             Some(original_config),
             b"model_provider = \"custom\"\n",
             "custom",
+            AuthUpdate::Keep,
             || Err("injected config write failure".into()),
         )
         .expect_err("config write should fail");

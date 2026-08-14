@@ -25,13 +25,15 @@ function errorMessage(error) {
 
 loginButton.addEventListener("click", async () => {
   loginButton.disabled = true;
+  configButton.disabled = true;
   try {
-    await invoke("start_official_login");
-    showToast("已启动 Codex 官方登录");
+    const result = await invoke("start_official_login");
+    showToast(`已切换官方登录，已统一 ${result.rolloutFilesUpdated} 个会话文件`);
   } catch (error) {
     showToast(errorMessage(error), true);
   } finally {
     loginButton.disabled = false;
+    configButton.disabled = false;
   }
 });
 
@@ -42,8 +44,10 @@ configButton.addEventListener("click", async () => {
   try {
     const config = await invoke("load_proxy_config");
     apiUrl.value = config.apiUrl;
-    if (config.hasApiKey) apiKey.placeholder = "已配置，输入新值后替换";
+    apiKey.required = !config.hasApiKey;
+    if (config.hasApiKey) apiKey.placeholder = "已配置，留空继续使用";
   } catch (error) {
+    apiKey.required = true;
     showToast(errorMessage(error), true);
   }
   dialog.showModal();
@@ -62,6 +66,8 @@ revealKey.addEventListener("click", () => {
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   saveButton.disabled = true;
+  loginButton.disabled = true;
+  configButton.disabled = true;
   saveButton.textContent = "保存中";
   try {
     const result = await invoke("save_proxy_config", { apiUrl: apiUrl.value, apiKey: apiKey.value });
@@ -73,6 +79,8 @@ form.addEventListener("submit", async (event) => {
     showToast(errorMessage(error), true);
   } finally {
     saveButton.disabled = false;
+    loginButton.disabled = false;
+    configButton.disabled = false;
     saveButton.textContent = "保存";
   }
 });

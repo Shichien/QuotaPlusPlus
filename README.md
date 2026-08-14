@@ -4,8 +4,10 @@ QuotaPlusPlus 是一个面向 Codex 的极简桌面配置工具，运行命令�
 
 主窗口只有两个入口：
 
-- 官方登录：启动 Codex 官方设备码登录；
+- 官方登录：切换到已经保存的 ChatGPT 官方登录；登录缺失或失效时，由 QuotaPlusPlus 打开浏览器完成官方 OAuth；
 - API 配置：填写 Responses API 的 API URL 和 API Key。
+
+QuotaPlusPlus 不会运行 `codex login`。如果当前官方登录有效，程序会通过刷新令牌测活并保存最新令牌；如果刷新令牌已失效，点击官方登录后才会打开浏览器。OAuth 使用 PKCE、本地一次性 `state` 校验以及 `localhost:1455` 或 `localhost:1457` 回调。
 
 API 配置会写入独立的 `custom` 提供方：
 
@@ -21,7 +23,11 @@ supports_websockets = false
 experimental_bearer_token = "API_KEY"
 ```
 
-程序不会读取或修改 Codex 登录凭据。保存 API 配置时，程序会扫描普通会话、归档会话和 Codex SQLite 状态数据库，把其中所有任务的提供方统一为 `custom`。修改前会把配置、rollout 元数据和 SQLite 备份到 `~/.codex/qpp-backups/`；其他配置和提供方定义保持不变，失败时自动恢复。
+第一次从官方切到 API 配置时，程序会把有效的 `auth.json` 和当时的 `config.toml` 保存到 `~/.codex/qpp-profiles/official/`。第三方配置以当前 `config.toml` 为底稿，只改顶层提供方和 `model_providers.custom`，因此桌面、插件、模型、通知和其他用户设置会继续保留。API Key 填过一次后可以留空继续使用。
+
+进入第三方模式时，活动目录中的 `auth.json` 会暂时移除，普通会话、归档会话和 Codex SQLite 状态数据库中的所有任务提供方会统一为 `custom`。切回官方时，程序会恢复配对的 `auth.json` 和 `config.toml`，并把所有任务提供方统一为 `openai`。对话正文、标题、时间和模型字段不会改动。
+
+每次切换前的活动配置、登录文件、rollout 元数据和 SQLite 会备份到 `~/.codex/qpp-backups/`。配置、登录文件、rollout 和 SQLite 属于同一次事务，任一步失败都会恢复。执行切换前需要退出 Codex，以免 SQLite 正在被占用。
 
 ## 下载和安装
 
