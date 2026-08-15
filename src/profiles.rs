@@ -68,11 +68,22 @@ impl ProfileStore {
         read_optional(&self.custom_dir().join("config.toml"))
     }
 
+    pub fn load_custom_auth(&self) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+        read_optional(&self.custom_dir().join("auth.json"))
+    }
+
     pub fn save_custom_config(&self, config: &[u8]) -> Result<(), Box<dyn Error>> {
         let directory = self.custom_dir();
         create_private_dir(&directory)?;
         atomic_write_private(&directory.join("config.toml"), config)?;
         verify_file(&directory.join("config.toml"), config)
+    }
+
+    pub fn save_custom_auth(&self, auth: &[u8]) -> Result<(), Box<dyn Error>> {
+        let directory = self.custom_dir();
+        create_private_dir(&directory)?;
+        atomic_write_private(&directory.join("auth.json"), auth)?;
+        verify_file(&directory.join("auth.json"), auth)
     }
 
     fn official_dir(&self) -> PathBuf {
@@ -196,6 +207,16 @@ mod tests {
                 .expect("load custom")
                 .expect("custom config"),
             b"model_provider = \"custom\"\n"
+        );
+        store
+            .save_custom_auth(b"{\"auth_mode\":\"apikey\"}")
+            .expect("save custom auth");
+        assert_eq!(
+            store
+                .load_custom_auth()
+                .expect("load custom auth")
+                .expect("custom auth"),
+            b"{\"auth_mode\":\"apikey\"}"
         );
     }
 }

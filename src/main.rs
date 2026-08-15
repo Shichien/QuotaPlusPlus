@@ -2,6 +2,7 @@
 
 use directories::UserDirs;
 use serde::Serialize;
+use serde_json::{Value, json};
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -107,6 +108,7 @@ fn install_proxy(
     } else {
         validate_api_key(api_key)?
     };
+    let custom_auth = build_custom_auth(api_key)?;
 
     let config_path = codex_home.join("config.toml");
     let original = read_optional_file(&config_path)?;
@@ -120,12 +122,13 @@ fn install_proxy(
     } else {
         profiles.save_custom_config(original_bytes)?;
     }
-    let updated = build_custom_config(original_text, &api_url, api_key)?;
+    let updated = build_custom_config(original_text, &api_url)?;
 
     activate_custom(
         codex_home,
         original.as_deref(),
         updated.as_bytes(),
+        &custom_auth,
         &profiles,
     )
 }
@@ -143,6 +146,9 @@ fn switch_to_official(codex_home: &Path) -> Result<ProviderSyncReport, Box<dyn E
 
     if !active_is_official {
         profiles.save_custom_config(original_bytes)?;
+        if let Some(auth) = read_custom_auth_for_profile(codex_home, original_bytes)? {
+            profiles.save_custom_auth(&auth)?;
+        }
     }
 
     let (candidate_auth, mut official_config) = if active_is_official {
@@ -205,17 +211,22 @@ fn activate_custom(
     codex_home: &Path,
     original_config: Option<&[u8]>,
     updated_config: &[u8],
+    custom_auth: &[u8],
     profiles: &ProfileStore,
 ) -> Result<ProviderSyncReport, Box<dyn Error>> {
     profiles.save_custom_config(updated_config)?;
+    profiles.save_custom_auth(custom_auth)?;
     let report = provider_sync::apply_provider_state(
         codex_home,
         original_config,
         updated_config,
         PROVIDER_ID,
-        AuthUpdate::Remove,
+        AuthUpdate::Replace(custom_auth),
     )?;
-    verify_custom_config(&codex_home.join("config.toml"))?;
+    verify_custom_config(
+        &codex_home.join("config.toml"),
+        &codex_home.join("auth.json"),
+    )?;
     Ok(report)
 }
 
@@ -262,26 +273,75 @@ fn read_proxy_config(codex_home: &Path) -> Result<ProxyConfig, Box<dyn Error>> {
             .and_then(Item::as_str)
             .unwrap_or_default()
             .to_string(),
-        has_api_key: provider
-            .and_then(|table| table.get("experimental_bearer_token"))
-            .and_then(Item::as_str)
-            .is_some_and(|key| !key.is_empty()),
+        has_api_key: read_stored_api_key(codex_home)?.is_some(),
     })
 }
 
 fn read_stored_api_key(codex_home: &Path) -> Result<Option<String>, Box<dyn Error>> {
-    let content = load_custom_source_config(codex_home)?;
-    let Some(content) = content else {
+    if let Some(auth) = load_custom_auth(codex_home)?
+        && let Some(key) = api_key_from_auth(&auth)?
+    {
+        return Ok(Some(key));
+    }
+
+    let Some(content) = load_custom_source_config(codex_home)? else {
         return Ok(None);
     };
+    read_legacy_api_key_from_config(&content)
+}
+
+fn load_custom_auth(codex_home: &Path) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+    let active_config = read_optional_file(&codex_home.join("config.toml"))?;
+    if let Some(config) = active_config.as_deref()
+        && config_selects_custom(config)?
+        && let Some(auth) = read_optional_file(&codex_home.join("auth.json"))?
+    {
+        return Ok(Some(auth));
+    }
+    ProfileStore::new(codex_home).load_custom_auth()
+}
+
+fn api_key_from_auth(auth: &[u8]) -> Result<Option<String>, Box<dyn Error>> {
+    let document: Value = match serde_json::from_slice(auth) {
+        Ok(Value::Object(document)) => Value::Object(document),
+        _ => return Ok(None),
+    };
+    Ok(document
+        .get("auth_mode")
+        .and_then(Value::as_str)
+        .filter(|mode| *mode == "apikey")
+        .and_then(|_| document.get("OPENAI_API_KEY"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string))
+}
+
+fn read_legacy_api_key_from_config(config: &[u8]) -> Result<Option<String>, Box<dyn Error>> {
     let content =
-        std::str::from_utf8(&content).map_err(|error| format!("第三方配置不是 UTF-8：{error}"))?;
+        std::str::from_utf8(config).map_err(|error| format!("第三方配置不是 UTF-8：{error}"))?;
     let document = parse_config(content)?;
     Ok(custom_provider(&document)
         .and_then(|provider| provider.get("experimental_bearer_token"))
         .and_then(Item::as_str)
+        .map(str::trim)
         .filter(|key| !key.is_empty())
         .map(str::to_string))
+}
+
+fn read_custom_auth_for_profile(
+    codex_home: &Path,
+    active_config: &[u8],
+) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+    if let Some(auth) = read_optional_file(&codex_home.join("auth.json"))?
+        && api_key_from_auth(&auth)?.is_some()
+    {
+        return Ok(Some(auth));
+    }
+    let Some(key) = read_legacy_api_key_from_config(active_config)? else {
+        return Ok(None);
+    };
+    Ok(Some(build_custom_auth(&key)?))
 }
 
 fn load_custom_source_config(codex_home: &Path) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
@@ -324,11 +384,7 @@ fn validate_api_key(input: &str) -> Result<&str, Box<dyn Error>> {
     Ok(key)
 }
 
-fn build_custom_config(
-    original: &str,
-    api_url: &str,
-    api_key: &str,
-) -> Result<String, Box<dyn Error>> {
+fn build_custom_config(original: &str, api_url: &str) -> Result<String, Box<dyn Error>> {
     let mut document = parse_config(original)?;
     document["model_provider"] = value(PROVIDER_ID);
     if !document.contains_key("model_providers") {
@@ -350,8 +406,24 @@ fn build_custom_config(
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(true);
     provider["supports_websockets"] = value(false);
-    provider["experimental_bearer_token"] = value(api_key);
+    for key in [
+        "experimental_bearer_token",
+        "env_key",
+        "env_key_instructions",
+        "auth",
+        "aws",
+    ] {
+        provider.remove(key);
+    }
     Ok(document.to_string())
+}
+
+fn build_custom_auth(api_key: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    let api_key = validate_api_key(api_key)?;
+    Ok(serde_json::to_vec_pretty(&json!({
+        "auth_mode": "apikey",
+        "OPENAI_API_KEY": api_key,
+    }))?)
 }
 
 fn build_official_config(original: &str) -> Result<String, Box<dyn Error>> {
@@ -400,7 +472,7 @@ fn custom_provider(document: &DocumentMut) -> Option<&Table> {
         .and_then(Item::as_table)
 }
 
-fn verify_custom_config(config_path: &Path) -> Result<(), Box<dyn Error>> {
+fn verify_custom_config(config_path: &Path, auth_path: &Path) -> Result<(), Box<dyn Error>> {
     let content = fs::read_to_string(config_path)?;
     let document = parse_config(&content)?;
     let provider = custom_provider(&document).ok_or("写入后的 custom 提供方不存在")?;
@@ -408,10 +480,8 @@ fn verify_custom_config(config_path: &Path) -> Result<(), Box<dyn Error>> {
         && provider.get("base_url").and_then(Item::as_str).is_some()
         && provider.get("wire_api").and_then(Item::as_str) == Some("responses")
         && provider.get("requires_openai_auth").and_then(Item::as_bool) == Some(true)
-        && provider
-            .get("experimental_bearer_token")
-            .and_then(Item::as_str)
-            .is_some_and(|key| !key.is_empty());
+        && !provider.contains_key("experimental_bearer_token")
+        && api_key_from_auth(&fs::read(auth_path)?)?.is_some();
     if !valid {
         return Err("配置写入后的验证未通过".into());
     }
@@ -446,8 +516,8 @@ base_url = "https://existing.example"
 [model_providers.custom]
 request_max_retries = 9
 "#;
-        let updated = build_custom_config(original, "https://proxy.example/v1", "secret")
-            .expect("build config");
+        let updated =
+            build_custom_config(original, "https://proxy.example/v1").expect("build config");
         let document = updated.parse::<DocumentMut>().expect("parse config");
         assert_eq!(document["model"].as_str(), Some("gpt-test"));
         assert_eq!(
@@ -459,9 +529,11 @@ request_max_retries = 9
             Some("Existing")
         );
         assert_eq!(document["model_provider"].as_str(), Some("custom"));
-        assert_eq!(
-            document["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
-            Some("secret")
+        assert!(
+            !document["model_providers"]["custom"]
+                .as_table()
+                .expect("custom provider table")
+                .contains_key("experimental_bearer_token")
         );
         assert_eq!(
             document["model_providers"]["custom"]["request_max_retries"].as_integer(),
@@ -492,18 +564,23 @@ request_max_retries = 9
         let custom = build_custom_config(
             std::str::from_utf8(official_config).expect("official utf8"),
             "https://proxy.example/v1",
-            "fixture-key",
         )
         .expect("build custom");
+        let custom_auth = build_custom_auth("fixture-key").expect("build custom auth");
 
         let custom_report = activate_custom(
             codex_home,
             Some(official_config),
             custom.as_bytes(),
+            &custom_auth,
             &profiles,
         )
         .expect("activate custom");
-        assert!(!codex_home.join("auth.json").exists());
+        let active_custom_auth: Value =
+            serde_json::from_slice(&fs::read(codex_home.join("auth.json")).expect("custom auth"))
+                .expect("parse custom auth");
+        assert_eq!(active_custom_auth["auth_mode"], "apikey");
+        assert_eq!(active_custom_auth["OPENAI_API_KEY"], "fixture-key");
         let backup = Path::new(&custom_report.backup_path);
         assert_eq!(
             fs::read(backup.join("auth.json")).expect("backup auth"),
@@ -559,15 +636,15 @@ request_max_retries = 9
             "model = \"official\"\n[model_providers.custom]\nbase_url = \"https://stale.example/v1\"\nexperimental_bearer_token = \"stale-key\"\n",
         )
         .expect("write official config");
-        let custom = build_custom_config(
-            "model = \"custom\"\n",
-            "https://proxy.example/v1",
-            "fixture-key",
-        )
-        .expect("build custom");
-        ProfileStore::new(directory.path())
+        let custom = build_custom_config("model = \"custom\"\n", "https://proxy.example/v1")
+            .expect("build custom");
+        let profiles = ProfileStore::new(directory.path());
+        profiles
             .save_custom_config(custom.as_bytes())
             .expect("save custom profile");
+        profiles
+            .save_custom_auth(&build_custom_auth("fixture-key").expect("build custom auth"))
+            .expect("save custom auth profile");
 
         let loaded = read_proxy_config(directory.path()).expect("read proxy config");
         assert_eq!(loaded.api_url, "https://proxy.example/v1");
@@ -576,6 +653,69 @@ request_max_retries = 9
             read_stored_api_key(directory.path()).expect("read stored key"),
             Some("fixture-key".to_string())
         );
+    }
+
+    #[test]
+    fn migrates_legacy_bearer_key_into_custom_auth_profile() {
+        let directory = tempdir().expect("tempdir");
+        let codex_home = directory.path();
+        let legacy = "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"Legacy\"\nbase_url = \"https://proxy.example/v1\"\nexperimental_bearer_token = \"legacy-key\"\n";
+        fs::write(codex_home.join("config.toml"), legacy).expect("write legacy config");
+        assert_eq!(
+            read_stored_api_key(codex_home).expect("read legacy key"),
+            Some("legacy-key".to_string())
+        );
+        let migrated = build_custom_auth(
+            &read_stored_api_key(codex_home)
+                .expect("read key")
+                .expect("legacy key"),
+        )
+        .expect("build migrated auth");
+        ProfileStore::new(codex_home)
+            .save_custom_auth(&migrated)
+            .expect("save migrated auth");
+        let auth: Value = serde_json::from_slice(
+            &ProfileStore::new(codex_home)
+                .load_custom_auth()
+                .expect("load migrated auth")
+                .expect("migrated auth"),
+        )
+        .expect("parse migrated auth");
+        assert_eq!(auth["auth_mode"], "apikey");
+        assert_eq!(auth["OPENAI_API_KEY"], "legacy-key");
+    }
+
+    #[test]
+    fn custom_auth_has_standard_codex_api_key_shape() {
+        let auth: Value =
+            serde_json::from_slice(&build_custom_auth("fixture-key").expect("build custom auth"))
+                .expect("parse custom auth");
+        assert_eq!(
+            auth,
+            json!({
+                "auth_mode": "apikey",
+                "OPENAI_API_KEY": "fixture-key",
+            })
+        );
+    }
+
+    #[test]
+    fn install_proxy_writes_api_key_to_active_auth_file() {
+        let directory = tempdir().expect("tempdir");
+        let codex_home = directory.path();
+        fs::write(codex_home.join("config.toml"), "model = \"gpt-test\"\n").expect("write config");
+
+        install_proxy(codex_home, "https://proxy.example/v1", "fixture-key")
+            .expect("install proxy");
+
+        let config = fs::read_to_string(codex_home.join("config.toml")).expect("read config");
+        assert!(config.contains("model_provider = \"custom\""));
+        assert!(!config.contains("experimental_bearer_token"));
+        let auth: Value =
+            serde_json::from_slice(&fs::read(codex_home.join("auth.json")).expect("read auth"))
+                .expect("parse auth");
+        assert_eq!(auth["auth_mode"], "apikey");
+        assert_eq!(auth["OPENAI_API_KEY"], "fixture-key");
     }
 
     #[test]

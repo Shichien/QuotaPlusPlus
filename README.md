@@ -20,12 +20,20 @@ base_url = "https://api.example.com/v1"
 wire_api = "responses"
 requires_openai_auth = true
 supports_websockets = false
-experimental_bearer_token = "API_KEY"
+```
+
+API Key 不写入 `config.toml`。第三方模式使用 Codex 标准的 `auth.json`：
+
+```json
+{
+  "auth_mode": "apikey",
+  "OPENAI_API_KEY": "API_KEY"
+}
 ```
 
 第一次从官方切到 API 配置时，程序会把有效的 `auth.json` 和当时的 `config.toml` 保存到 `~/.codex/qpp-profiles/official/`。第三方配置以当前 `config.toml` 为底稿，只改顶层提供方和 `model_providers.custom`，因此桌面、插件、模型、通知和其他用户设置会继续保留。API Key 填过一次后可以留空继续使用。
 
-进入第三方模式时，活动目录中的 `auth.json` 会暂时移除，普通会话、归档会话和 Codex SQLite 状态数据库中的所有任务提供方会统一为 `custom`。切回官方时，程序会恢复配对的 `auth.json` 和 `config.toml`，并把所有任务提供方统一为 `openai`。对话正文、标题、时间和模型字段不会改动。
+进入第三方模式时，活动目录中的 `auth.json` 会切换为 API Key 格式，普通会话、归档会话和 Codex SQLite 状态数据库中的所有任务提供方会统一为 `custom`。切回官方时，程序会恢复配对的官方 `auth.json` 和 `config.toml`，并把所有任务提供方统一为 `openai`。对话正文、标题、时间和模型字段不会改动。
 
 每次切换前的活动配置、登录文件、rollout 元数据和 SQLite 会备份到 `~/.codex/qpp-backups/`。配置、登录文件、rollout 和 SQLite 属于同一次事务，任一步失败都会恢复。执行切换前需要退出 Codex，以免 SQLite 正在被占用。
 
@@ -66,7 +74,20 @@ notepad install.ps1
 
 ### macOS
 
-Apple 芯片 Mac 下载 `qpp-macos-arm64.dmg`，Intel Mac 下载 `qpp-macos-x64.dmg`，打开后把 QuotaPlusPlus 拖入应用程序目录。
+安装了 Homebrew 的 Mac 可以执行：
+
+```bash
+brew tap shichien/qpp https://github.com/Shichien/QuotaPlusPlus && brew install --cask --no-quarantine shichien/qpp/qpp
+```
+
+Homebrew 会自动选择 Apple 芯片或 Intel 成品，把 QuotaPlusPlus 安装到应用程序目录，并提供 `qpp` 命令。升级和卸载分别使用：
+
+```bash
+brew update && brew upgrade --cask shichien/qpp/qpp
+brew uninstall --cask shichien/qpp/qpp
+```
+
+也可以手动下载 `qpp-macos-arm64.dmg` 或 `qpp-macos-x64.dmg`，打开后把 QuotaPlusPlus 拖入应用程序目录。
 
 当前发布包没有使用 Apple 开发者证书签名。首次启动时，需要在访达中右键点击 QuotaPlusPlus 并选择打开。
 

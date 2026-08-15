@@ -63,7 +63,6 @@ pub enum AuthUpdate<'a> {
     #[cfg(test)]
     Keep,
     Replace(&'a [u8]),
-    Remove,
 }
 
 #[derive(Serialize)]
@@ -205,15 +204,6 @@ where
                 }
                 if fs::read(&auth_path)? != auth {
                     return Err("auth.json 写入后的字节验证失败".into());
-                }
-            }
-            AuthUpdate::Remove => {
-                auth_mutated = original_auth.is_some();
-                if auth_mutated {
-                    fs::remove_file(&auth_path)?;
-                }
-                if auth_path.exists() {
-                    return Err("auth.json 移除后的验证未通过".into());
                 }
             }
         }

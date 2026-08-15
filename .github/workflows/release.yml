@@ -56,6 +56,10 @@ jobs:
       - name: Run tests
         run: cargo test --locked
 
+      - name: Validate Homebrew Cask
+        if: matrix.artifact == 'qpp-macos-arm64'
+        run: brew style Casks/qpp.rb
+
       - name: Build Windows executable
         if: runner.os == 'Windows'
         run: cargo build --release --locked
@@ -66,6 +70,22 @@ jobs:
         with:
           args: ${{ matrix.tauri_args }}
           retryAttempts: 2
+
+      - name: Verify macOS bundle layout
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          dmg="$(find "target/${{ matrix.target }}/release/bundle/dmg" -name '*.dmg' -print -quit)"
+          test -n "$dmg"
+          mount_dir="$(mktemp -d)"
+          cleanup() {
+            hdiutil detach "$mount_dir" >/dev/null 2>&1 || true
+            rmdir "$mount_dir" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          hdiutil attach "$dmg" -mountpoint "$mount_dir" -nobrowse -readonly
+          test -d "$mount_dir/QuotaPlusPlus.app"
+          test -x "$mount_dir/QuotaPlusPlus.app/Contents/MacOS/qpp"
 
       - name: Prepare Windows release assets
         if: runner.os == 'Windows'
