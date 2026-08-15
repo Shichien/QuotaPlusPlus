@@ -306,11 +306,15 @@ fn api_key_from_auth(auth: &[u8]) -> Result<Option<String>, Box<dyn Error>> {
         Ok(Value::Object(document)) => Value::Object(document),
         _ => return Ok(None),
     };
-    Ok(document
+    if document
         .get("auth_mode")
         .and_then(Value::as_str)
-        .filter(|mode| *mode == "apikey")
-        .and_then(|_| document.get("OPENAI_API_KEY"))
+        .is_some_and(|mode| mode != "apikey")
+    {
+        return Ok(None);
+    }
+    Ok(document
+        .get("OPENAI_API_KEY")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|key| !key.is_empty())
@@ -322,8 +326,12 @@ fn read_legacy_api_key_from_config(config: &[u8]) -> Result<Option<String>, Box<
         std::str::from_utf8(config).map_err(|error| format!("第三方配置不是 UTF-8：{error}"))?;
     let document = parse_config(content)?;
     Ok(custom_provider(&document)
-        .and_then(|provider| provider.get("experimental_bearer_token"))
-        .and_then(Item::as_str)
+        .and_then(|provider| {
+            provider
+                .iter()
+                .find(|(key, item)| is_bearer_token_field(key) && item.as_str().is_some())
+                .and_then(|(_, item)| item.as_str())
+        })
         .map(str::trim)
         .filter(|key| !key.is_empty())
         .map(str::to_string))
@@ -406,22 +414,40 @@ fn build_custom_config(original: &str, api_url: &str) -> Result<String, Box<dyn 
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(true);
     provider["supports_websockets"] = value(false);
-    for key in [
-        "experimental_bearer_token",
-        "env_key",
-        "env_key_instructions",
-        "auth",
-        "aws",
-    ] {
-        provider.remove(key);
+    let credential_keys = provider
+        .iter()
+        .map(|(key, _)| key.to_string())
+        .filter(|key| is_provider_credential_field(key))
+        .collect::<Vec<_>>();
+    for key in credential_keys {
+        provider.remove(&key);
     }
     Ok(document.to_string())
+}
+
+fn is_provider_credential_field(key: &str) -> bool {
+    let normalized = normalize_config_key(key);
+    matches!(
+        normalized.as_str(),
+        "envkey" | "envkeyinstructions" | "auth" | "aws"
+    ) || is_bearer_token_field(key)
+}
+
+fn is_bearer_token_field(key: &str) -> bool {
+    let normalized = normalize_config_key(key);
+    normalized.contains("bearer") && normalized.contains("token")
+}
+
+fn normalize_config_key(key: &str) -> String {
+    key.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn build_custom_auth(api_key: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     let api_key = validate_api_key(api_key)?;
     Ok(serde_json::to_vec_pretty(&json!({
-        "auth_mode": "apikey",
         "OPENAI_API_KEY": api_key,
     }))?)
 }
@@ -476,12 +502,22 @@ fn verify_custom_config(config_path: &Path, auth_path: &Path) -> Result<(), Box<
     let content = fs::read_to_string(config_path)?;
     let document = parse_config(&content)?;
     let provider = custom_provider(&document).ok_or("写入后的 custom 提供方不存在")?;
+    let auth: Value = serde_json::from_slice(&fs::read(auth_path)?)?;
+    let auth_has_only_api_key = auth.as_object().is_some_and(|object| {
+        object.len() == 1
+            && object
+                .get("OPENAI_API_KEY")
+                .and_then(Value::as_str)
+                .is_some_and(|key| !key.trim().is_empty())
+    });
     let valid = document.get("model_provider").and_then(Item::as_str) == Some(PROVIDER_ID)
         && provider.get("base_url").and_then(Item::as_str).is_some()
         && provider.get("wire_api").and_then(Item::as_str) == Some("responses")
         && provider.get("requires_openai_auth").and_then(Item::as_bool) == Some(true)
-        && !provider.contains_key("experimental_bearer_token")
-        && api_key_from_auth(&fs::read(auth_path)?)?.is_some();
+        && !provider
+            .iter()
+            .any(|(key, _)| is_provider_credential_field(key))
+        && auth_has_only_api_key;
     if !valid {
         return Err("配置写入后的验证未通过".into());
     }
@@ -515,6 +551,9 @@ base_url = "https://existing.example"
 
 [model_providers.custom]
 request_max_retries = 9
+experimental_bearer_token = "legacy-one"
+experimetal_bearer_token = "legacy-two"
+env_key = "LEGACY_API_KEY"
 "#;
         let updated =
             build_custom_config(original, "https://proxy.example/v1").expect("build config");
@@ -529,11 +568,13 @@ request_max_retries = 9
             Some("Existing")
         );
         assert_eq!(document["model_provider"].as_str(), Some("custom"));
+        let custom_provider = document["model_providers"]["custom"]
+            .as_table()
+            .expect("custom provider table");
         assert!(
-            !document["model_providers"]["custom"]
-                .as_table()
-                .expect("custom provider table")
-                .contains_key("experimental_bearer_token")
+            !custom_provider
+                .iter()
+                .any(|(key, _)| is_provider_credential_field(key))
         );
         assert_eq!(
             document["model_providers"]["custom"]["request_max_retries"].as_integer(),
@@ -579,7 +620,10 @@ request_max_retries = 9
         let active_custom_auth: Value =
             serde_json::from_slice(&fs::read(codex_home.join("auth.json")).expect("custom auth"))
                 .expect("parse custom auth");
-        assert_eq!(active_custom_auth["auth_mode"], "apikey");
+        assert_eq!(
+            active_custom_auth.as_object().expect("auth object").len(),
+            1
+        );
         assert_eq!(active_custom_auth["OPENAI_API_KEY"], "fixture-key");
         let backup = Path::new(&custom_report.backup_path);
         assert_eq!(
@@ -659,7 +703,7 @@ request_max_retries = 9
     fn migrates_legacy_bearer_key_into_custom_auth_profile() {
         let directory = tempdir().expect("tempdir");
         let codex_home = directory.path();
-        let legacy = "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"Legacy\"\nbase_url = \"https://proxy.example/v1\"\nexperimental_bearer_token = \"legacy-key\"\n";
+        let legacy = "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"Legacy\"\nbase_url = \"https://proxy.example/v1\"\nexperimetal_bearer_token = \"legacy-key\"\n";
         fs::write(codex_home.join("config.toml"), legacy).expect("write legacy config");
         assert_eq!(
             read_stored_api_key(codex_home).expect("read legacy key"),
@@ -681,7 +725,7 @@ request_max_retries = 9
                 .expect("migrated auth"),
         )
         .expect("parse migrated auth");
-        assert_eq!(auth["auth_mode"], "apikey");
+        assert_eq!(auth.as_object().expect("auth object").len(), 1);
         assert_eq!(auth["OPENAI_API_KEY"], "legacy-key");
     }
 
@@ -693,7 +737,6 @@ request_max_retries = 9
         assert_eq!(
             auth,
             json!({
-                "auth_mode": "apikey",
                 "OPENAI_API_KEY": "fixture-key",
             })
         );
@@ -710,12 +753,39 @@ request_max_retries = 9
 
         let config = fs::read_to_string(codex_home.join("config.toml")).expect("read config");
         assert!(config.contains("model_provider = \"custom\""));
-        assert!(!config.contains("experimental_bearer_token"));
+        assert!(!config.contains("bearer_token"));
         let auth: Value =
             serde_json::from_slice(&fs::read(codex_home.join("auth.json")).expect("read auth"))
                 .expect("parse auth");
-        assert_eq!(auth["auth_mode"], "apikey");
+        assert_eq!(auth.as_object().expect("auth object").len(), 1);
         assert_eq!(auth["OPENAI_API_KEY"], "fixture-key");
+    }
+
+    #[test]
+    fn install_proxy_migrates_legacy_bearer_field_when_key_input_is_empty() {
+        let directory = tempdir().expect("tempdir");
+        let codex_home = directory.path();
+        fs::write(
+            codex_home.join("config.toml"),
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://old.example/v1\"\nexperimetal_bearer_token = \"legacy-key\"\n",
+        )
+        .expect("write legacy config");
+
+        install_proxy(codex_home, "https://proxy.example/v1", "")
+            .expect("migrate legacy proxy config");
+
+        let config = fs::read_to_string(codex_home.join("config.toml")).expect("read config");
+        let document = parse_config(&config).expect("parse migrated config");
+        let provider = custom_provider(&document).expect("custom provider");
+        assert!(
+            !provider
+                .iter()
+                .any(|(key, _)| is_provider_credential_field(key))
+        );
+        let auth: Value =
+            serde_json::from_slice(&fs::read(codex_home.join("auth.json")).expect("read auth"))
+                .expect("parse auth");
+        assert_eq!(auth, json!({"OPENAI_API_KEY": "legacy-key"}));
     }
 
     #[test]

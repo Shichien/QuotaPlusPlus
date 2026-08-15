@@ -26,7 +26,6 @@ API Key 不写入 `config.toml`。第三方模式使用 Codex 标准的 `auth.js
 
 ```json
 {
-  "auth_mode": "apikey",
   "OPENAI_API_KEY": "API_KEY"
 }
 ```

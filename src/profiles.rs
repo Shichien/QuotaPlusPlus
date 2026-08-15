@@ -209,14 +209,14 @@ mod tests {
             b"model_provider = \"custom\"\n"
         );
         store
-            .save_custom_auth(b"{\"auth_mode\":\"apikey\"}")
+            .save_custom_auth(b"{\"OPENAI_API_KEY\":\"fixture-key\"}")
             .expect("save custom auth");
         assert_eq!(
             store
                 .load_custom_auth()
                 .expect("load custom auth")
                 .expect("custom auth"),
-            b"{\"auth_mode\":\"apikey\"}"
+            b"{\"OPENAI_API_KEY\":\"fixture-key\"}"
         );
     }
 }
