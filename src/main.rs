@@ -360,6 +360,7 @@ fn validate_api_key(input: &str) -> Result<&str, Box<dyn Error>> {
 fn build_custom_config(original: &str, api_url: &str) -> Result<String, Box<dyn Error>> {
     let mut document = parse_config(original)?;
     document["model_provider"] = value(PROVIDER_ID);
+    document["cli_auth_credentials_store"] = value("file");
     if !document.contains_key("model_providers") {
         let mut providers = Table::new();
         providers.set_implicit(true);
@@ -373,7 +374,6 @@ fn build_custom_config(original: &str, api_url: &str) -> Result<String, Box<dyn 
     provider["base_url"] = value(api_url);
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(true);
-    provider["supports_websockets"] = value(false);
     providers[PROVIDER_ID] = Item::Table(provider);
     Ok(document.to_string())
 }
@@ -444,6 +444,10 @@ fn verify_custom_config(config_path: &Path, auth_path: &Path) -> Result<(), Box<
                 .is_some_and(|key| !key.trim().is_empty())
     });
     let valid = document.get("model_provider").and_then(Item::as_str) == Some(PROVIDER_ID)
+        && document
+            .get("cli_auth_credentials_store")
+            .and_then(Item::as_str)
+            == Some("file")
         && provider.get("base_url").and_then(Item::as_str).is_some()
         && provider.get("wire_api").and_then(Item::as_str) == Some("responses")
         && provider.get("requires_openai_auth").and_then(Item::as_bool) == Some(true)
@@ -471,6 +475,7 @@ mod tests {
     #[test]
     fn custom_config_preserves_unmanaged_settings_and_providers() {
         let original = r#"model = "gpt-test"
+cli_auth_credentials_store = "keyring"
 
 [desktop]
 localeOverride = "zh-CN"
@@ -498,6 +503,10 @@ request_max_retries = 9
         );
         assert_eq!(document["model_provider"].as_str(), Some("custom"));
         assert_eq!(
+            document["cli_auth_credentials_store"].as_str(),
+            Some("file")
+        );
+        assert_eq!(
             document["model_providers"]["custom"]["name"].as_str(),
             Some("QuotaPlusPlus")
         );
@@ -516,7 +525,7 @@ request_max_retries = 9
     fn official_and_custom_round_trip_restores_exact_active_files() {
         let directory = tempdir().expect("tempdir");
         let codex_home = directory.path();
-        let official_config = b"model = \"gpt-official\"\n[desktop]\nlocaleOverride = \"zh-CN\"\n";
+        let official_config = b"model = \"gpt-official\"\ncli_auth_credentials_store = \"keyring\"\n[desktop]\nlocaleOverride = \"zh-CN\"\n";
         let official_auth =
             b"{\"auth_mode\":\"chatgpt\",\"tokens\":{\"refresh_token\":\"sensitive-refresh-token\"}}";
         fs::write(codex_home.join("config.toml"), official_config).expect("write config");
@@ -555,6 +564,14 @@ request_max_retries = 9
             1
         );
         assert_eq!(active_custom_auth["OPENAI_API_KEY"], "fixture-key");
+        let active_custom_config =
+            fs::read_to_string(codex_home.join("config.toml")).expect("read active custom config");
+        let active_custom_document =
+            parse_config(&active_custom_config).expect("parse custom config");
+        assert_eq!(
+            active_custom_document["cli_auth_credentials_store"].as_str(),
+            Some("file")
+        );
         let backup = Path::new(&custom_report.backup_path);
         assert_eq!(
             fs::read(backup.join("auth.json")).expect("backup auth"),

@@ -13,13 +13,13 @@ API 配置会写入独立的 `custom` 提供方：
 
 ```toml
 model_provider = "custom"
+cli_auth_credentials_store = "file"
 
 [model_providers.custom]
 name = "QuotaPlusPlus"
 base_url = "https://api.example.com/v1"
 wire_api = "responses"
 requires_openai_auth = true
-supports_websockets = false
 ```
 
 API Key 不写入 `config.toml`。第三方模式使用 Codex 标准的 `auth.json`：
@@ -29,6 +29,8 @@ API Key 不写入 `config.toml`。第三方模式使用 Codex 标准的 `auth.js
   "OPENAI_API_KEY": "API_KEY"
 }
 ```
+
+第三方模式会把 `cli_auth_credentials_store` 临时设为 `file`，确保 macOS 也把活动 API Key 保存在 `~/.codex/auth.json`，而不是转存到系统钥匙串。切回官方时会恢复之前保存的完整 `config.toml`，包括用户原来的凭据存储设置。
 
 第一次从官方切到 API 配置时，程序会把有效的 `auth.json` 和当时的 `config.toml` 保存到 `~/.codex/qpp-profiles/official/`。第三方配置以当前 `config.toml` 为底稿，只改顶层提供方和 `model_providers.custom`，因此桌面、插件、模型、通知和其他用户设置会继续保留。API Key 填过一次后可以留空继续使用。
 
