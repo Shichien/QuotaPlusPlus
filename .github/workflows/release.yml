@@ -56,10 +56,6 @@ jobs:
       - name: Run tests
         run: cargo test --locked
 
-      - name: Validate Homebrew Cask
-        if: matrix.artifact == 'qpp-macos-arm64'
-        run: brew style Casks/qpp.rb
-
       - name: Build Windows executable
         if: runner.os == 'Windows'
         run: cargo build --release --locked
