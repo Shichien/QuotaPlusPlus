@@ -2,7 +2,7 @@ use chrono::Local;
 use fs2::FileExt;
 use rusqlite::backup::Backup;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -12,12 +12,16 @@ use std::io::{self, BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use toml_edit::{DocumentMut, Item};
 
 const BACKUP_DIR: &str = "qpp-backups";
+const TRANSACTION_FILE: &str = "qpp-sync-transaction.json";
+const MAX_BACKUPS: usize = 10;
 const STATE_DB_NAME: &str = "state_5.sqlite";
 const SESSION_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
+static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,6 +62,40 @@ struct BackupManifest<'a> {
     rollout_files: Vec<RolloutBackupEntry<'a>>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryManifest {
+    version: u8,
+    config_present: bool,
+    auth_present: bool,
+    sqlite_path: Option<String>,
+    rollout_files: Vec<RecoveryRolloutEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryRolloutEntry {
+    path: String,
+    original_first_line: String,
+    updated_first_line: String,
+    separator: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TransactionPhase {
+    Prepared,
+    Committed,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransactionJournal {
+    version: u8,
+    backup_name: String,
+    phase: TransactionPhase,
+}
+
 #[derive(Clone, Copy)]
 pub enum AuthUpdate<'a> {
     #[cfg(test)]
@@ -70,6 +108,7 @@ pub enum AuthUpdate<'a> {
 struct RolloutBackupEntry<'a> {
     path: String,
     original_first_line: &'a str,
+    updated_first_line: &'a str,
     separator: &'a str,
     original_provider: &'a str,
 }
@@ -108,6 +147,12 @@ pub fn apply_provider_state(
     )
 }
 
+pub fn recover_pending_state(codex_home: &Path) -> Result<(), Box<dyn Error>> {
+    fs::create_dir_all(codex_home)?;
+    let _operation_lock = acquire_operation_lock(codex_home)?;
+    recover_pending_transaction_locked(codex_home)
+}
+
 fn apply_provider_config_with_hook<F>(
     codex_home: &Path,
     original_config: Option<&[u8]>,
@@ -121,6 +166,7 @@ where
 {
     fs::create_dir_all(codex_home)?;
     let _operation_lock = acquire_operation_lock(codex_home)?;
+    recover_pending_transaction_locked(codex_home)?;
     let auth_path = codex_home.join("auth.json");
     let original_auth = match fs::read(&auth_path) {
         Ok(content) => Some(content),
@@ -153,6 +199,8 @@ where
         &providers_detected,
         target_provider,
     )?;
+    prune_backups(codex_home, &backup_dir)?;
+    let mut journal = begin_transaction(codex_home, &backup_dir)?;
 
     let config_path = codex_home.join("config.toml");
     let mut applied_rollouts = Vec::new();
@@ -162,6 +210,7 @@ where
 
     let result = (|| -> Result<ProviderSyncReport, Box<dyn Error>> {
         for (index, change) in changes.iter().enumerate() {
+            applied_rollouts.push(index);
             rewrite_first_line(
                 &change.path,
                 &change.original_first_line,
@@ -169,7 +218,6 @@ where
                 &change.updated_first_line,
                 index,
             )?;
-            applied_rollouts.push(index);
         }
 
         let sqlite_rows_updated = match state_db.as_deref() {
@@ -217,7 +265,32 @@ where
     })();
 
     match result {
-        Ok(report) => Ok(report),
+        Ok(report) => {
+            journal.phase = TransactionPhase::Committed;
+            if let Err(error) = write_transaction_journal(codex_home, &journal) {
+                let rollback_errors = rollback(
+                    &config_path,
+                    original_config,
+                    &auth_path,
+                    original_auth.as_deref(),
+                    &backup_dir,
+                    state_db.as_deref(),
+                    sqlite_mutated,
+                    config_written,
+                    auth_mutated,
+                    &changes,
+                    &applied_rollouts,
+                );
+                return finish_failed_transaction(
+                    codex_home,
+                    format!("无法提交同步事务：{error}"),
+                    rollback_errors,
+                    &backup_dir,
+                );
+            }
+            clear_transaction_journal(codex_home)?;
+            Ok(report)
+        }
         Err(error) => {
             let rollback_errors = rollback(
                 &config_path,
@@ -232,17 +305,31 @@ where
                 &changes,
                 &applied_rollouts,
             );
-            if rollback_errors.is_empty() {
-                Err(format!("同步失败，所有改动已恢复：{error}").into())
-            } else {
-                Err(format!(
-                    "同步失败且自动恢复不完整：{error}。恢复错误：{}。备份位于 {}",
-                    rollback_errors.join("；"),
-                    backup_dir.display()
-                )
-                .into())
-            }
+            finish_failed_transaction(codex_home, error.to_string(), rollback_errors, &backup_dir)
         }
+    }
+}
+
+fn finish_failed_transaction<T>(
+    codex_home: &Path,
+    error: String,
+    mut rollback_errors: Vec<String>,
+    backup_dir: &Path,
+) -> Result<T, Box<dyn Error>> {
+    if rollback_errors.is_empty()
+        && let Err(clear_error) = clear_transaction_journal(codex_home)
+    {
+        rollback_errors.push(format!("清除事务记录失败：{clear_error}"));
+    }
+    if rollback_errors.is_empty() {
+        Err(format!("同步失败，所有改动已恢复：{error}").into())
+    } else {
+        Err(format!(
+            "同步失败且自动恢复不完整：{error}。恢复错误：{}。备份位于 {}",
+            rollback_errors.join("；"),
+            backup_dir.display()
+        )
+        .into())
     }
 }
 
@@ -259,6 +346,185 @@ fn acquire_operation_lock(codex_home: &Path) -> Result<File, Box<dyn Error>> {
             format!("另一个 QuotaPlusPlus 同步正在进行，请等待其完成后重试：{error}").into()
         })?;
     Ok(file)
+}
+
+fn begin_transaction(
+    codex_home: &Path,
+    backup_dir: &Path,
+) -> Result<TransactionJournal, Box<dyn Error>> {
+    let backup_name = backup_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("备份目录名称无效")?
+        .to_string();
+    validate_backup_name(&backup_name)?;
+    let journal = TransactionJournal {
+        version: 1,
+        backup_name,
+        phase: TransactionPhase::Prepared,
+    };
+    write_transaction_journal(codex_home, &journal)?;
+    Ok(journal)
+}
+
+fn write_transaction_journal(
+    codex_home: &Path,
+    journal: &TransactionJournal,
+) -> Result<(), Box<dyn Error>> {
+    let content = serde_json::to_vec_pretty(journal)?;
+    atomic_write(&codex_home.join(TRANSACTION_FILE), &content)
+}
+
+fn clear_transaction_journal(codex_home: &Path) -> Result<(), Box<dyn Error>> {
+    let path = codex_home.join(TRANSACTION_FILE);
+    match fs::remove_file(&path) {
+        Ok(()) => sync_directory(codex_home),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn recover_pending_transaction_locked(codex_home: &Path) -> Result<(), Box<dyn Error>> {
+    let journal_path = codex_home.join(TRANSACTION_FILE);
+    let content = match fs::read(&journal_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let journal: TransactionJournal = serde_json::from_slice(&content)
+        .map_err(|error| format!("未完成同步的事务记录无效：{error}"))?;
+    if journal.version != 1 {
+        return Err(format!("不支持的同步事务版本：{}", journal.version).into());
+    }
+    validate_backup_name(&journal.backup_name)?;
+    if journal.phase == TransactionPhase::Committed {
+        clear_transaction_journal(codex_home)?;
+        return Ok(());
+    }
+
+    let backup_dir = codex_home.join(BACKUP_DIR).join(&journal.backup_name);
+    let manifest_path = backup_dir.join("manifest.json");
+    let manifest: RecoveryManifest = serde_json::from_slice(&fs::read(&manifest_path)?)
+        .map_err(|error| format!("未完成同步的备份清单无效：{error}"))?;
+    if manifest.version != 2 {
+        return Err(format!("不支持的同步备份版本：{}", manifest.version).into());
+    }
+
+    let mut errors = Vec::new();
+    restore_from_recovery_manifest(codex_home, &backup_dir, &manifest, &mut errors);
+    if errors.is_empty() {
+        clear_transaction_journal(codex_home)?;
+        Ok(())
+    } else {
+        Err(format!(
+            "检测到上次未完成的同步，但自动恢复不完整：{}。备份位于 {}",
+            errors.join("；"),
+            backup_dir.display()
+        )
+        .into())
+    }
+}
+
+fn restore_from_recovery_manifest(
+    codex_home: &Path,
+    backup_dir: &Path,
+    manifest: &RecoveryManifest,
+    errors: &mut Vec<String>,
+) {
+    for (name, present) in [
+        ("auth.json", manifest.auth_present),
+        ("config.toml", manifest.config_present),
+    ] {
+        let destination = codex_home.join(name);
+        let content = if present {
+            match fs::read(backup_dir.join(name)) {
+                Ok(content) => Some(content),
+                Err(error) => {
+                    errors.push(format!("读取 {name} 备份失败：{error}"));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        if let Err(error) = restore_optional_file(&destination, content.as_deref()) {
+            errors.push(format!("恢复 {name} 失败：{error}"));
+        }
+    }
+
+    if let Some(destination) = manifest.sqlite_path.as_deref() {
+        let source = backup_dir.join("sqlite").join(STATE_DB_NAME);
+        if let Err(error) = restore_sqlite(&source, Path::new(destination)) {
+            errors.push(format!("恢复 SQLite 失败：{error}"));
+        }
+    }
+
+    for (index, entry) in manifest.rollout_files.iter().enumerate() {
+        let path = PathBuf::from(&entry.path);
+        if let Err(error) = validate_rollout_recovery_path(codex_home, &path).and_then(|()| {
+            restore_first_line(
+                &path,
+                &entry.original_first_line,
+                &entry.updated_first_line,
+                &entry.separator,
+                index,
+            )
+        }) {
+            errors.push(format!("恢复 rollout 失败 {}：{error}", path.display()));
+        }
+    }
+}
+
+fn validate_backup_name(name: &str) -> Result<(), Box<dyn Error>> {
+    let path = Path::new(name);
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || path.components().count() != 1
+        || !path.is_relative()
+    {
+        return Err("同步事务中的备份目录名称无效".into());
+    }
+    Ok(())
+}
+
+fn validate_rollout_recovery_path(codex_home: &Path, path: &Path) -> Result<(), Box<dyn Error>> {
+    let canonical_home = codex_home.canonicalize()?;
+    let canonical_path = path.canonicalize()?;
+    let relative = canonical_path
+        .strip_prefix(&canonical_home)
+        .map_err(|_| "rollout 恢复路径不在 Codex 目录内")?;
+    let first = relative.components().next().ok_or("rollout 恢复路径无效")?;
+    let allowed = SESSION_DIRS
+        .iter()
+        .any(|directory| first.as_os_str() == std::ffi::OsStr::new(directory));
+    if !allowed {
+        return Err("rollout 恢复路径不属于会话目录".into());
+    }
+    Ok(())
+}
+
+fn restore_first_line(
+    path: &Path,
+    original_first_line: &str,
+    updated_first_line: &str,
+    separator: &str,
+    sequence: usize,
+) -> Result<(), Box<dyn Error>> {
+    let (current_first_line, current_separator) = read_first_line(path)?;
+    if current_first_line == original_first_line && current_separator == separator {
+        return Ok(());
+    }
+    if current_first_line != updated_first_line || current_separator != separator {
+        return Err("rollout 在同步中断后又发生了变化".into());
+    }
+    rewrite_first_line(
+        path,
+        updated_first_line,
+        separator,
+        original_first_line,
+        sequence,
+    )
 }
 
 fn collect_rollout_changes(
@@ -386,6 +652,7 @@ fn rewrite_first_line(
         drop(output);
         drop(reader);
         replace_file(&temporary, path)?;
+        sync_directory(path.parent().ok_or("rollout 文件没有父目录")?)?;
         Ok(())
     })();
     if write_result.is_err() {
@@ -605,47 +872,98 @@ fn create_backup(
     providers_detected: &[ProviderCount],
     target_provider: &str,
 ) -> Result<PathBuf, Box<dyn Error>> {
-    let timestamp = Local::now().format("%Y%m%d-%H%M%S-%3f").to_string();
-    let backup_dir = codex_home.join(BACKUP_DIR).join(timestamp);
-    fs::create_dir_all(&backup_dir)?;
+    let backup_root = codex_home.join(BACKUP_DIR);
+    fs::create_dir_all(&backup_root)?;
     #[cfg(unix)]
-    fs::set_permissions(&backup_dir, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(&backup_root, fs::Permissions::from_mode(0o700))?;
+    let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+    let timestamp = Local::now().format("%Y%m%d-%H%M%S-%6f").to_string();
+    let name = format!("{timestamp}-{sequence}");
+    let backup_dir = backup_root.join(&name);
+    let staging_dir = backup_root.join(format!(".{name}-{}.tmp", std::process::id()));
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        fs::create_dir(&staging_dir)?;
+        #[cfg(unix)]
+        fs::set_permissions(&staging_dir, fs::Permissions::from_mode(0o700))?;
 
-    if let Some(config) = original_config {
-        write_new_file(&backup_dir.join("config.toml"), config)?;
-    }
-    if let Some(auth) = original_auth {
-        write_new_file(&backup_dir.join("auth.json"), auth)?;
-    }
-    if let Some(path) = state_db {
-        let sqlite_backup = backup_dir.join("sqlite").join(STATE_DB_NAME);
-        fs::create_dir_all(sqlite_backup.parent().expect("sqlite backup parent"))?;
-        backup_sqlite(path, &sqlite_backup)?;
-    }
+        if let Some(config) = original_config {
+            write_new_file(&staging_dir.join("config.toml"), config)?;
+        }
+        if let Some(auth) = original_auth {
+            write_new_file(&staging_dir.join("auth.json"), auth)?;
+        }
+        if let Some(path) = state_db {
+            let sqlite_backup = staging_dir.join("sqlite").join(STATE_DB_NAME);
+            fs::create_dir_all(sqlite_backup.parent().expect("sqlite backup parent"))?;
+            backup_sqlite(path, &sqlite_backup)?;
+        }
 
-    let manifest = BackupManifest {
-        version: 2,
-        created_at: Local::now().to_rfc3339(),
-        target_provider,
-        config_present: original_config.is_some(),
-        auth_present: original_auth.is_some(),
-        sqlite_path: state_db.map(|path| path.to_string_lossy().into_owned()),
-        providers_detected,
-        rollout_files: changes
-            .iter()
-            .map(|change| RolloutBackupEntry {
-                path: change.path.to_string_lossy().into_owned(),
-                original_first_line: &change.original_first_line,
-                separator: &change.separator,
-                original_provider: &change.original_provider,
-            })
-            .collect(),
-    };
-    write_new_file(
-        &backup_dir.join("manifest.json"),
-        serde_json::to_vec_pretty(&manifest)?.as_slice(),
-    )?;
+        let manifest = BackupManifest {
+            version: 2,
+            created_at: Local::now().to_rfc3339(),
+            target_provider,
+            config_present: original_config.is_some(),
+            auth_present: original_auth.is_some(),
+            sqlite_path: state_db.map(|path| path.to_string_lossy().into_owned()),
+            providers_detected,
+            rollout_files: changes
+                .iter()
+                .map(|change| RolloutBackupEntry {
+                    path: change.path.to_string_lossy().into_owned(),
+                    original_first_line: &change.original_first_line,
+                    updated_first_line: &change.updated_first_line,
+                    separator: &change.separator,
+                    original_provider: &change.original_provider,
+                })
+                .collect(),
+        };
+        write_new_file(
+            &staging_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest)?.as_slice(),
+        )?;
+        sync_directory(&staging_dir)?;
+        fs::rename(&staging_dir, &backup_dir)?;
+        sync_directory(&backup_root)?;
+        Ok(())
+    })();
+    if result.is_err() && staging_dir.is_dir() {
+        let _ = fs::remove_dir_all(&staging_dir);
+    }
+    result?;
     Ok(backup_dir)
+}
+
+fn prune_backups(codex_home: &Path, preserve: &Path) -> Result<(), Box<dyn Error>> {
+    let root = codex_home.join(BACKUP_DIR);
+    if !root.is_dir() {
+        return Ok(());
+    }
+    let mut completed = Vec::new();
+    for entry in fs::read_dir(&root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(format!("备份目录包含符号链接：{}", path.display()).into());
+        }
+        if !file_type.is_dir() || path == preserve {
+            continue;
+        }
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            fs::remove_dir_all(&path)?;
+            continue;
+        }
+        completed.push(path);
+    }
+    completed.sort();
+    let remove_count = completed
+        .len()
+        .saturating_add(1)
+        .saturating_sub(MAX_BACKUPS);
+    for path in completed.into_iter().take(remove_count) {
+        fs::remove_dir_all(path)?;
+    }
+    sync_directory(&root)
 }
 
 fn backup_sqlite(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
@@ -703,11 +1021,11 @@ fn rollback(
     }
     for index in applied_rollouts.iter().rev() {
         let change = &changes[*index];
-        if let Err(error) = rewrite_first_line(
+        if let Err(error) = restore_first_line(
             &change.path,
+            &change.original_first_line,
             &change.updated_first_line,
             &change.separator,
-            &change.original_first_line,
             *index,
         ) {
             errors.push(format!(
@@ -757,11 +1075,12 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<(), Box<dyn Error>> {
     let parent = path.parent().ok_or("文件没有父目录")?;
     fs::create_dir_all(parent)?;
     let temporary = parent.join(format!(
-        ".{}.qpp-{}.tmp",
+        ".{}.qpp-{}-{}.tmp",
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("file"),
-        std::process::id()
+        std::process::id(),
+        NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
     ));
     let result = (|| -> Result<(), Box<dyn Error>> {
         let mut options = OpenOptions::new();
@@ -772,12 +1091,24 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<(), Box<dyn Error>> {
         file.write_all(content)?;
         file.sync_all()?;
         replace_file(&temporary, path)?;
+        sync_directory(parent)?;
         Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), Box<dyn Error>> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sync_directory(_path: &Path) -> Result<(), Box<dyn Error>> {
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -789,7 +1120,9 @@ fn replace_file(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>>
 #[cfg(windows)]
 fn replace_file(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MoveFileExW};
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
 
     let source = source
         .as_os_str()
@@ -805,7 +1138,7 @@ fn replace_file(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>>
         MoveFileExW(
             source.as_ptr(),
             destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING,
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
     };
     if result == 0 {
@@ -928,6 +1261,144 @@ mod tests {
             Path::new(&report.backup_path)
                 .join("sqlite/state_5.sqlite")
                 .is_file()
+        );
+        assert!(!codex_home.join(TRANSACTION_FILE).exists());
+    }
+
+    #[test]
+    fn prepared_transaction_is_restored_on_next_start() {
+        let directory = tempdir().expect("tempdir");
+        let codex_home = directory.path();
+        let rollout = codex_home.join("sessions/rollout-interrupted.jsonl");
+        create_rollout(
+            &rollout,
+            Some("openai"),
+            r#"{"type":"event_msg","payload":{"message":"preserved"}}"#,
+        );
+        let original_rollout = fs::read(&rollout).expect("read rollout");
+        let state_db = codex_home.join("sqlite/state_5.sqlite");
+        create_state_db(&state_db, &[Some("openai")]);
+        let original_config = b"model = \"official\"\n";
+        let original_auth = b"{\"tokens\":{}}";
+        fs::write(codex_home.join("config.toml"), original_config).expect("write config");
+        fs::write(codex_home.join("auth.json"), original_auth).expect("write auth");
+
+        let changes = collect_rollout_changes(codex_home, "custom").expect("collect changes");
+        let sqlite_counts = read_sqlite_provider_counts(&state_db).expect("provider counts");
+        let providers = merge_provider_counts(&changes, &sqlite_counts);
+        let backup = create_backup(
+            codex_home,
+            Some(original_config),
+            Some(original_auth),
+            Some(&state_db),
+            &changes,
+            &providers,
+            "custom",
+        )
+        .expect("create backup");
+        begin_transaction(codex_home, &backup).expect("begin transaction");
+
+        rewrite_first_line(
+            &rollout,
+            &changes[0].original_first_line,
+            &changes[0].separator,
+            &changes[0].updated_first_line,
+            0,
+        )
+        .expect("mutate rollout");
+        update_sqlite_provider(&state_db, "custom").expect("mutate sqlite");
+        fs::write(
+            codex_home.join("config.toml"),
+            b"model_provider = \"custom\"\n",
+        )
+        .expect("mutate config");
+        fs::write(
+            codex_home.join("auth.json"),
+            b"{\"OPENAI_API_KEY\":\"fixture\"}",
+        )
+        .expect("mutate auth");
+
+        recover_pending_state(codex_home).expect("recover interrupted transaction");
+
+        assert_eq!(
+            fs::read(&rollout).expect("read restored rollout"),
+            original_rollout
+        );
+        assert_eq!(
+            fs::read(codex_home.join("config.toml")).expect("read restored config"),
+            original_config
+        );
+        assert_eq!(
+            fs::read(codex_home.join("auth.json")).expect("read restored auth"),
+            original_auth
+        );
+        let connection = Connection::open(state_db).expect("open restored sqlite");
+        let provider: String = connection
+            .query_row(
+                "SELECT model_provider FROM threads WHERE id = 'thread-0'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read restored provider");
+        assert_eq!(provider, "openai");
+        assert!(!codex_home.join(TRANSACTION_FILE).exists());
+    }
+
+    #[test]
+    fn committed_transaction_is_kept_when_cleanup_was_interrupted() {
+        let directory = tempdir().expect("tempdir");
+        let codex_home = directory.path();
+        let original = b"model = \"official\"\n";
+        fs::write(codex_home.join("config.toml"), original).expect("write config");
+        let backup = create_backup(codex_home, Some(original), None, None, &[], &[], "custom")
+            .expect("create backup");
+        let mut journal = begin_transaction(codex_home, &backup).expect("begin transaction");
+        fs::write(
+            codex_home.join("config.toml"),
+            b"model_provider = \"custom\"\n",
+        )
+        .expect("write committed config");
+        journal.phase = TransactionPhase::Committed;
+        write_transaction_journal(codex_home, &journal).expect("mark committed");
+
+        recover_pending_state(codex_home).expect("finish committed transaction");
+
+        assert_eq!(
+            fs::read(codex_home.join("config.toml")).expect("read active config"),
+            b"model_provider = \"custom\"\n"
+        );
+        assert!(!codex_home.join(TRANSACTION_FILE).exists());
+    }
+
+    #[test]
+    fn backup_retention_keeps_only_the_ten_newest_directories() {
+        let directory = tempdir().expect("tempdir");
+        let codex_home = directory.path();
+        let root = codex_home.join(BACKUP_DIR);
+        fs::create_dir_all(&root).expect("create backup root");
+        for index in 0..12 {
+            fs::create_dir(root.join(format!("20260101-000000-{index:02}")))
+                .expect("create old backup");
+        }
+        let preserve = root.join("20260101-000000-12");
+        fs::create_dir(&preserve).expect("create current backup");
+
+        prune_backups(codex_home, &preserve).expect("prune backups");
+
+        let remaining = fs::read_dir(root).expect("read backups").count();
+        assert_eq!(remaining, MAX_BACKUPS);
+        assert!(preserve.is_dir());
+        assert!(
+            !codex_home
+                .join(BACKUP_DIR)
+                .join("20260101-000000-00")
+                .exists()
+        );
+        assert!(
+            codex_home
+                .join(BACKUP_DIR)
+                .join("20260101-000000-03")
+                .is_dir()
         );
     }
 

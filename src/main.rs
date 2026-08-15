@@ -10,9 +10,12 @@ use std::sync::{Mutex, MutexGuard, TryLockError};
 use toml_edit::{DocumentMut, Item, Table, value};
 use url::Url;
 
+mod auth_storage;
 mod oauth;
+mod operation_lock;
 mod profiles;
 mod provider_sync;
+mod proxy_probe;
 
 use oauth::AuthHealth;
 use profiles::ProfileStore;
@@ -44,6 +47,9 @@ fn main() {
 #[tauri::command]
 fn load_proxy_config() -> Result<ProxyConfig, String> {
     let codex_home = resolve_codex_home().map_err(display_error)?;
+    let _guard = acquire_app_operation().map_err(display_error)?;
+    let _process_guard = operation_lock::acquire(&codex_home).map_err(display_error)?;
+    provider_sync::recover_pending_state(&codex_home).map_err(display_error)?;
     read_proxy_config(&codex_home).map_err(display_error)
 }
 
@@ -52,6 +58,8 @@ async fn save_proxy_config(api_url: String, api_key: String) -> Result<ProviderS
     let codex_home = resolve_codex_home().map_err(display_error)?;
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = acquire_app_operation().map_err(display_error)?;
+        let _process_guard = operation_lock::acquire(&codex_home).map_err(display_error)?;
+        provider_sync::recover_pending_state(&codex_home).map_err(display_error)?;
         install_proxy(&codex_home, &api_url, &api_key).map_err(display_error)
     })
     .await
@@ -64,6 +72,8 @@ async fn start_official_login() -> Result<ProviderSyncReport, String> {
     let codex_home = resolve_codex_home().map_err(display_error)?;
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = acquire_app_operation().map_err(display_error)?;
+        let _process_guard = operation_lock::acquire(&codex_home).map_err(display_error)?;
+        provider_sync::recover_pending_state(&codex_home).map_err(display_error)?;
         switch_to_official(&codex_home).map_err(display_error)
     })
     .await
@@ -100,15 +110,33 @@ fn install_proxy(
     api_url: &str,
     api_key: &str,
 ) -> Result<ProviderSyncReport, Box<dyn Error>> {
+    install_proxy_with_probe(codex_home, api_url, api_key, proxy_probe::validate_proxy)
+}
+
+fn install_proxy_with_probe<F>(
+    codex_home: &Path,
+    api_url: &str,
+    api_key: &str,
+    probe: F,
+) -> Result<ProviderSyncReport, Box<dyn Error>>
+where
+    F: FnOnce(&str, &str) -> Result<(), Box<dyn Error>>,
+{
     let api_url = normalize_api_url(api_url)?;
     fs::create_dir_all(codex_home)?;
     let stored_api_key = read_stored_api_key(codex_home)?;
     let api_key = if api_key.trim().is_empty() {
-        stored_api_key.as_deref().ok_or("API Key 不能为空")?
+        let stored_api_key = stored_api_key.as_deref().ok_or("API Key 不能为空")?;
+        let stored_api_url = read_stored_api_url(codex_home)?;
+        if stored_api_url.as_deref() != Some(api_url.as_str()) {
+            return Err("API URL 已变化，请重新填写对应的 API Key".into());
+        }
+        stored_api_key
     } else {
         validate_api_key(api_key)?
     };
     let custom_auth = build_custom_auth(api_key)?;
+    probe(&api_url, api_key)?;
 
     let config_path = codex_home.join("config.toml");
     let original = read_optional_file(&config_path)?;
@@ -153,7 +181,7 @@ fn switch_to_official(codex_home: &Path) -> Result<ProviderSyncReport, Box<dyn E
 
     let (candidate_auth, mut official_config) = if active_is_official {
         (
-            read_optional_file(&codex_home.join("auth.json"))?,
+            auth_storage::load_official_auth(codex_home, original_bytes)?,
             original_bytes.to_vec(),
         )
     } else if let Some(profile) = profiles.load_official()? {
@@ -171,6 +199,7 @@ fn switch_to_official(codex_home: &Path) -> Result<ProviderSyncReport, Box<dyn E
     if !is_official_config(official_text)? {
         official_config = build_official_config(official_text)?.into_bytes();
     }
+    official_config = auth_storage::use_file_credentials(&official_config)?;
 
     let official_auth = match candidate_auth {
         Some(auth) => match oauth::refresh_auth(&auth)? {
@@ -195,15 +224,16 @@ fn capture_official_profile(
     profiles: &ProfileStore,
     config: &[u8],
 ) -> Result<(), Box<dyn Error>> {
-    profiles.save_official_config(config)?;
-    let Some(auth) = read_optional_file(&codex_home.join("auth.json"))? else {
+    let managed_config = auth_storage::use_file_credentials(config)?;
+    profiles.save_official_config(&managed_config)?;
+    let Some(auth) = auth_storage::load_official_auth(codex_home, config)? else {
         profiles.discard_official_auth()?;
         return Ok(());
     };
     match oauth::refresh_auth(&auth) {
-        Ok(AuthHealth::Valid(refreshed)) => profiles.save_official(config, &refreshed),
+        Ok(AuthHealth::Valid(refreshed)) => profiles.save_official(&managed_config, &refreshed),
         Ok(AuthHealth::Invalid) => profiles.discard_official_auth(),
-        Err(_) => profiles.save_official(config, &auth),
+        Err(_) => profiles.save_official(&managed_config, &auth),
     }
 }
 
@@ -284,6 +314,20 @@ fn read_stored_api_key(codex_home: &Path) -> Result<Option<String>, Box<dyn Erro
     api_key_from_auth(&auth)
 }
 
+fn read_stored_api_url(codex_home: &Path) -> Result<Option<String>, Box<dyn Error>> {
+    let Some(content) = load_custom_source_config(codex_home)? else {
+        return Ok(None);
+    };
+    let text = std::str::from_utf8(&content)
+        .map_err(|error| format!("第三方 config.toml 不是 UTF-8：{error}"))?;
+    let document = parse_config(text)?;
+    custom_provider(&document)
+        .and_then(|provider| provider.get("base_url"))
+        .and_then(Item::as_str)
+        .map(normalize_api_url)
+        .transpose()
+}
+
 fn load_custom_auth(codex_home: &Path) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
     let active_config = read_optional_file(&codex_home.join("config.toml"))?;
     if let Some(config) = active_config.as_deref()
@@ -343,7 +387,10 @@ fn normalize_api_url(input: &str) -> Result<String, Box<dyn Error>> {
     if parsed.host_str().is_none() || parsed.query().is_some() || parsed.fragment().is_some() {
         return Err("API URL 必须是没有查询参数和片段的基础地址".into());
     }
-    Ok(input.to_string())
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("API URL 不能包含用户名或密码".into());
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
 }
 
 fn validate_api_key(input: &str) -> Result<&str, Box<dyn Error>> {
@@ -472,6 +519,14 @@ mod tests {
     use serde_json::Value;
     use tempfile::tempdir;
 
+    fn install_proxy_fixture(
+        codex_home: &Path,
+        api_url: &str,
+        api_key: &str,
+    ) -> Result<ProviderSyncReport, Box<dyn Error>> {
+        install_proxy_with_probe(codex_home, api_url, api_key, |_, _| Ok(()))
+    }
+
     #[test]
     fn custom_config_preserves_unmanaged_settings_and_providers() {
         let original = r#"model = "gpt-test"
@@ -525,7 +580,7 @@ request_max_retries = 9
     fn official_and_custom_round_trip_restores_exact_active_files() {
         let directory = tempdir().expect("tempdir");
         let codex_home = directory.path();
-        let official_config = b"model = \"gpt-official\"\ncli_auth_credentials_store = \"keyring\"\n[desktop]\nlocaleOverride = \"zh-CN\"\n";
+        let official_config = b"model = \"gpt-official\"\ncli_auth_credentials_store = \"file\"\n[desktop]\nlocaleOverride = \"zh-CN\"\n";
         let official_auth =
             b"{\"auth_mode\":\"chatgpt\",\"tokens\":{\"refresh_token\":\"sensitive-refresh-token\"}}";
         fs::write(codex_home.join("config.toml"), official_config).expect("write config");
@@ -665,7 +720,7 @@ request_max_retries = 9
         let codex_home = directory.path();
         fs::write(codex_home.join("config.toml"), "model = \"gpt-test\"\n").expect("write config");
 
-        install_proxy(codex_home, "https://proxy.example/v1", "fixture-key")
+        install_proxy_fixture(codex_home, "https://proxy.example/v1", "fixture-key")
             .expect("install proxy");
 
         let config = fs::read_to_string(codex_home.join("config.toml")).expect("read config");
@@ -678,16 +733,45 @@ request_max_retries = 9
     }
 
     #[test]
+    fn first_proxy_configuration_does_not_require_an_official_login() {
+        let directory = tempdir().expect("tempdir");
+        let codex_home = directory.path();
+
+        install_proxy_fixture(codex_home, "https://proxy.example/v1", "fixture-key")
+            .expect("install proxy in empty Codex home");
+
+        let config = fs::read_to_string(codex_home.join("config.toml")).expect("read config");
+        assert!(config.contains("model_provider = \"custom\""));
+        let auth: Value =
+            serde_json::from_slice(&fs::read(codex_home.join("auth.json")).expect("read auth"))
+                .expect("parse auth");
+        assert_eq!(auth, json!({"OPENAI_API_KEY": "fixture-key"}));
+        assert!(
+            ProfileStore::new(codex_home)
+                .load_official()
+                .expect("load official profile")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn install_proxy_reuses_saved_custom_auth_when_key_input_is_empty() {
         let directory = tempdir().expect("tempdir");
         let codex_home = directory.path();
         fs::write(codex_home.join("config.toml"), "model = \"gpt-official\"\n")
             .expect("write official config");
         ProfileStore::new(codex_home)
+            .save_custom_config(
+                build_custom_config("", "https://proxy.example/v1")
+                    .expect("build saved custom config")
+                    .as_bytes(),
+            )
+            .expect("save custom config");
+        ProfileStore::new(codex_home)
             .save_custom_auth(&build_custom_auth("saved-key").expect("build custom auth"))
             .expect("save custom auth");
 
-        install_proxy(codex_home, "https://proxy.example/v1", "")
+        install_proxy_fixture(codex_home, "https://proxy.example/v1", "")
             .expect("install proxy with saved key");
 
         let config = fs::read_to_string(codex_home.join("config.toml")).expect("read config");
@@ -697,6 +781,75 @@ request_max_retries = 9
             serde_json::from_slice(&fs::read(codex_home.join("auth.json")).expect("read auth"))
                 .expect("parse auth");
         assert_eq!(auth, json!({"OPENAI_API_KEY": "saved-key"}));
+    }
+
+    #[test]
+    fn empty_key_is_rejected_on_first_configuration() {
+        let directory = tempdir().expect("tempdir");
+
+        let error = install_proxy_fixture(directory.path(), "https://proxy.example/v1", "")
+            .expect_err("missing key should fail");
+
+        assert!(error.to_string().contains("API Key 不能为空"), "{error}");
+        assert!(!directory.path().join("config.toml").exists());
+        assert!(!directory.path().join("auth.json").exists());
+    }
+
+    #[test]
+    fn empty_key_cannot_be_reused_for_a_different_url() {
+        let directory = tempdir().expect("tempdir");
+        let codex_home = directory.path();
+        let active_config = b"model = \"official\"\n";
+        let active_auth = b"{\"auth_mode\":\"chatgpt\"}";
+        fs::write(codex_home.join("config.toml"), active_config).expect("write active config");
+        fs::write(codex_home.join("auth.json"), active_auth).expect("write active auth");
+        let profiles = ProfileStore::new(codex_home);
+        profiles
+            .save_custom_config(
+                build_custom_config("", "https://old.example/v1")
+                    .expect("build old config")
+                    .as_bytes(),
+            )
+            .expect("save old config");
+        profiles
+            .save_custom_auth(&build_custom_auth("old-key").expect("build old auth"))
+            .expect("save old auth");
+
+        let error = install_proxy_fixture(codex_home, "https://new.example/v1", "")
+            .expect_err("changed URL should require key");
+
+        assert!(error.to_string().contains("API URL 已变化"), "{error}");
+        assert_eq!(
+            fs::read(codex_home.join("config.toml")).unwrap(),
+            active_config
+        );
+        assert_eq!(fs::read(codex_home.join("auth.json")).unwrap(), active_auth);
+    }
+
+    #[test]
+    fn failed_proxy_probe_does_not_change_active_state() {
+        let directory = tempdir().expect("tempdir");
+        let codex_home = directory.path();
+        let active_config = b"model = \"official\"\n";
+        let active_auth = b"{\"auth_mode\":\"chatgpt\"}";
+        fs::write(codex_home.join("config.toml"), active_config).expect("write active config");
+        fs::write(codex_home.join("auth.json"), active_auth).expect("write active auth");
+
+        let error = install_proxy_with_probe(
+            codex_home,
+            "https://proxy.example/v1",
+            "fixture-key",
+            |_, _| Err("代理预检失败".into()),
+        )
+        .expect_err("probe should fail");
+
+        assert_eq!(error.to_string(), "代理预检失败");
+        assert_eq!(
+            fs::read(codex_home.join("config.toml")).unwrap(),
+            active_config
+        );
+        assert_eq!(fs::read(codex_home.join("auth.json")).unwrap(), active_auth);
+        assert!(!codex_home.join("qpp-profiles").exists());
     }
 
     #[test]
@@ -712,6 +865,7 @@ request_max_retries = 9
     fn rejects_invalid_inputs() {
         assert!(normalize_api_url("file:///tmp/api").is_err());
         assert!(normalize_api_url("https://proxy.example/v1?x=1").is_err());
+        assert!(normalize_api_url("https://user:password@proxy.example/v1").is_err());
         assert!(validate_api_key("has whitespace").is_err());
     }
 }

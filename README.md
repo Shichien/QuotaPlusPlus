@@ -30,13 +30,15 @@ API Key 不写入 `config.toml`。第三方模式使用 Codex 标准的 `auth.js
 }
 ```
 
-第三方模式会把 `cli_auth_credentials_store` 临时设为 `file`，确保 macOS 也把活动 API Key 保存在 `~/.codex/auth.json`，而不是转存到系统钥匙串。切回官方时会恢复之前保存的完整 `config.toml`，包括用户原来的凭据存储设置。
+第三方模式会把 `cli_auth_credentials_store` 设为 `file`，确保 macOS 也把活动 API Key 保存在 `~/.codex/auth.json`，而不是转存到系统钥匙串。QPP 能读取 Codex 的文件、系统钥匙串和加密认证存储；接管官方会话后也会把官方凭据存储统一为 `file`，保证刷新令牌轮换后恢复的是同一份最新认证。模型、桌面、插件、MCP、通知和其他用户设置保持不变。
 
-第一次从官方切到 API 配置时，程序会把有效的 `auth.json` 和当时的 `config.toml` 保存到 `~/.codex/qpp-profiles/official/`。第三方配置以当前 `config.toml` 为底稿，只改顶层提供方和 `model_providers.custom`，因此桌面、插件、模型、通知和其他用户设置会继续保留。API Key 填过一次后可以留空继续使用。
+第一次从官方切到 API 配置时，程序会把有效的官方认证和当时的 `config.toml` 配对保存到 `~/.codex/qpp-profiles/official/`。第三方配置以当前 `config.toml` 为底稿，只改顶层提供方和 `model_providers.custom`。API Key 填过一次后，同一个 API URL 可以留空继续使用；API URL 变化时必须重新填写对应的 API Key，避免把旧地址的密钥发送给新地址。
+
+保存第三方配置前，QPP 会向对应的 `/responses` 发送不含模型和输入的空请求，检查网络、认证和端点是否可用。这个请求不会触发模型推理；完整的模型、流式响应和工具调用兼容性仍由实际请求决定。
 
 进入第三方模式时，活动目录中的 `auth.json` 会切换为 API Key 格式，普通会话、归档会话和 Codex SQLite 状态数据库中的所有任务提供方会统一为 `custom`。切回官方时，程序会恢复配对的官方 `auth.json` 和 `config.toml`，并把所有任务提供方统一为 `openai`。对话正文、标题、时间和模型字段不会改动。
 
-每次切换前的活动配置、登录文件、rollout 元数据和 SQLite 会备份到 `~/.codex/qpp-backups/`。配置、登录文件、rollout 和 SQLite 属于同一次事务，任一步失败都会恢复。执行切换前需要退出 Codex，以免 SQLite 正在被占用。
+每次切换前的活动配置、登录文件、rollout 元数据和 SQLite 会备份到 `~/.codex/qpp-backups/`，只保留最新十份完整备份。配置、登录文件、rollout 和 SQLite 属于同一次持久化事务；普通错误会立即恢复，进程被强制结束或设备断电时会在下次启动继续恢复。执行切换前需要退出 Codex，以免 SQLite 正在被占用。
 
 ## 下载和安装
 
