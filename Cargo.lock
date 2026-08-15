@@ -3478,7 +3478,7 @@ dependencies = [
 
 [[package]]
 name = "qpp"
-version = "0.3.5"
+version = "0.1.0"
 dependencies = [
  "age",
  "base64 0.22.1",
