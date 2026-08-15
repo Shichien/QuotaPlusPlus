@@ -217,14 +217,20 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
     match fs::read(path) {
         Ok(content) => Ok(Some(content)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+        Err(error) => Err(format!("读取快照文件失败 {}：{error}", path.display()).into()),
     }
 }
 
 fn create_private_dir(path: &Path) -> Result<(), Box<dyn Error>> {
-    fs::create_dir_all(path)?;
+    fs::create_dir_all(path).map_err(|error| -> Box<dyn Error> {
+        format!("创建快照目录失败 {}：{error}", path.display()).into()
+    })?;
     #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(
+        |error| -> Box<dyn Error> {
+            format!("设置快照目录权限失败 {}：{error}", path.display()).into()
+        },
+    )?;
     Ok(())
 }
 
@@ -273,7 +279,7 @@ fn atomic_write_private(path: &Path, content: &[u8]) -> Result<(), Box<dyn Error
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    result
+    result.map_err(|error| format!("写入快照文件失败 {}：{error}", path.display()).into())
 }
 
 #[cfg(unix)]

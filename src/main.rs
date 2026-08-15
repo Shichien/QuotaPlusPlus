@@ -46,38 +46,52 @@ fn main() {
 
 #[tauri::command]
 fn load_proxy_config() -> Result<ProxyConfig, String> {
-    let codex_home = resolve_codex_home().map_err(display_error)?;
-    let _guard = acquire_app_operation().map_err(display_error)?;
-    let _process_guard = operation_lock::acquire(&codex_home).map_err(display_error)?;
-    provider_sync::recover_pending_state(&codex_home).map_err(display_error)?;
-    read_proxy_config(&codex_home).map_err(display_error)
+    let codex_home = resolve_codex_home().map_err(resolve_home_error)?;
+    let _guard = acquire_app_operation()
+        .map_err(|error| operation_error(&codex_home, "获取应用操作锁", error))?;
+    let _process_guard = operation_lock::acquire(&codex_home)
+        .map_err(|error| operation_error(&codex_home, "获取跨进程操作锁", error))?;
+    provider_sync::recover_pending_state(&codex_home)
+        .map_err(|error| operation_error(&codex_home, "恢复上次未完成的操作", error))?;
+    read_proxy_config(&codex_home)
+        .map_err(|error| operation_error(&codex_home, "读取 API 配置", error))
 }
 
 #[tauri::command]
 async fn save_proxy_config(api_url: String, api_key: String) -> Result<ProviderSyncReport, String> {
-    let codex_home = resolve_codex_home().map_err(display_error)?;
+    let codex_home = resolve_codex_home().map_err(resolve_home_error)?;
+    let task_home = codex_home.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _guard = acquire_app_operation().map_err(display_error)?;
-        let _process_guard = operation_lock::acquire(&codex_home).map_err(display_error)?;
-        provider_sync::recover_pending_state(&codex_home).map_err(display_error)?;
-        install_proxy(&codex_home, &api_url, &api_key).map_err(display_error)
+        let _guard = acquire_app_operation()
+            .map_err(|error| operation_error(&task_home, "获取应用操作锁", error))?;
+        let _process_guard = operation_lock::acquire(&task_home)
+            .map_err(|error| operation_error(&task_home, "获取跨进程操作锁", error))?;
+        provider_sync::recover_pending_state(&task_home)
+            .map_err(|error| operation_error(&task_home, "恢复上次未完成的操作", error))?;
+        install_proxy(&task_home, &api_url, &api_key)
+            .map_err(|error| operation_error(&task_home, "验证并写入 API 配置", error))
     })
     .await
-    .map_err(|error| format!("API 配置任务异常结束：{error}"))?
+    .map_err(|error| operation_error(&codex_home, "等待 API 配置任务", error))?
 }
 
 #[tauri::command]
 async fn start_official_login() -> Result<ProviderSyncReport, String> {
     oauth::begin_login();
-    let codex_home = resolve_codex_home().map_err(display_error)?;
+    let codex_home = resolve_codex_home().map_err(resolve_home_error)?;
+    let task_home = codex_home.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _guard = acquire_app_operation().map_err(display_error)?;
-        let _process_guard = operation_lock::acquire(&codex_home).map_err(display_error)?;
-        provider_sync::recover_pending_state(&codex_home).map_err(display_error)?;
-        switch_to_official(&codex_home).map_err(display_error)
+        let _guard = acquire_app_operation()
+            .map_err(|error| operation_error(&task_home, "获取应用操作锁", error))?;
+        let _process_guard = operation_lock::acquire(&task_home)
+            .map_err(|error| operation_error(&task_home, "获取跨进程操作锁", error))?;
+        provider_sync::recover_pending_state(&task_home)
+            .map_err(|error| operation_error(&task_home, "恢复上次未完成的操作", error))?;
+        switch_to_official(&task_home)
+            .map_err(|error| operation_error(&task_home, "恢复官方登录", error))
     })
     .await
-    .map_err(|error| format!("官方登录任务异常结束：{error}"))?
+    .map_err(|error| operation_error(&codex_home, "等待官方登录任务", error))?
 }
 
 #[tauri::command]
@@ -93,8 +107,19 @@ fn acquire_app_operation() -> Result<MutexGuard<'static, ()>, Box<dyn Error>> {
     }
 }
 
-fn display_error(error: impl std::fmt::Display) -> String {
-    error.to_string()
+fn resolve_home_error(error: impl std::fmt::Display) -> String {
+    format!("失败阶段：定位 Codex 目录\n原因：{error}")
+}
+
+fn operation_error(codex_home: &Path, stage: &str, error: impl std::fmt::Display) -> String {
+    let reason = error.to_string();
+    if reason == "官方登录已取消" {
+        return reason;
+    }
+    format!(
+        "Codex 目录：{}\n失败阶段：{stage}\n原因：{reason}",
+        codex_home.display()
+    )
 }
 
 fn resolve_codex_home() -> Result<PathBuf, Box<dyn Error>> {
@@ -565,7 +590,7 @@ fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
     match fs::read(path) {
         Ok(content) => Ok(Some(content)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+        Err(error) => Err(format!("读取 {} 失败：{error}", path.display()).into()),
     }
 }
 
@@ -575,6 +600,30 @@ mod tests {
     use base64::Engine;
     use serde_json::Value;
     use tempfile::tempdir;
+
+    #[test]
+    fn operation_errors_include_home_stage_and_reason() {
+        let error = operation_error(
+            Path::new("/fixture/.codex"),
+            "写入配置",
+            "Permission denied",
+        );
+        assert!(error.contains("Codex 目录：/fixture/.codex"));
+        assert!(error.contains("失败阶段：写入配置"));
+        assert!(error.contains("原因：Permission denied"));
+    }
+
+    #[test]
+    fn cancelled_login_stays_a_plain_status() {
+        assert_eq!(
+            operation_error(
+                Path::new("/fixture/.codex"),
+                "恢复官方登录",
+                "官方登录已取消"
+            ),
+            "官方登录已取消"
+        );
+    }
 
     fn install_proxy_fixture(
         codex_home: &Path,

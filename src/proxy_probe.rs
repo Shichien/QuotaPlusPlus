@@ -63,13 +63,15 @@ mod tests {
     use std::thread;
     use tiny_http::{Response, Server, StatusCode as TinyStatusCode};
 
-    fn mock_server(status: u16) -> (String, thread::JoinHandle<()>) {
+    fn mock_server(status: u16, base_path: &str) -> (String, thread::JoinHandle<()>) {
         let server = Server::http("127.0.0.1:0").expect("bind mock server");
         let address = server.server_addr();
+        let base_path = base_path.trim_end_matches('/').to_string();
+        let expected_path = format!("{base_path}/responses");
         let handle = thread::spawn(move || {
             let mut request = server.recv().expect("receive probe");
             assert_eq!(request.method().as_str(), "POST");
-            assert_eq!(request.url(), "/v1/responses");
+            assert_eq!(request.url(), expected_path);
             let authorization = request
                 .headers()
                 .iter()
@@ -86,19 +88,26 @@ mod tests {
                 .respond(Response::empty(TinyStatusCode(status)))
                 .expect("respond to probe");
         });
-        (format!("http://{address}/v1"), handle)
+        (format!("http://{address}{base_path}"), handle)
     }
 
     #[test]
     fn accepts_schema_error_from_existing_responses_endpoint() {
-        let (url, server) = mock_server(400);
+        let (url, server) = mock_server(400, "/v1");
         validate_proxy(&url, "fixture-key").expect("accept endpoint");
         server.join().expect("join server");
     }
 
     #[test]
+    fn accepts_responses_endpoint_at_domain_root() {
+        let (url, server) = mock_server(400, "");
+        validate_proxy(&url, "fixture-key").expect("accept root endpoint");
+        server.join().expect("join server");
+    }
+
+    #[test]
     fn rejects_invalid_proxy_credentials() {
-        let (url, server) = mock_server(401);
+        let (url, server) = mock_server(401, "/v1");
         let error = validate_proxy(&url, "fixture-key").expect_err("reject credentials");
         assert!(error.to_string().contains("API Key 验证失败"));
         server.join().expect("join server");

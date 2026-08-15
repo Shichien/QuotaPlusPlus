@@ -148,7 +148,9 @@ pub fn apply_provider_state(
 }
 
 pub fn recover_pending_state(codex_home: &Path) -> Result<(), Box<dyn Error>> {
-    fs::create_dir_all(codex_home)?;
+    fs::create_dir_all(codex_home).map_err(|error| -> Box<dyn Error> {
+        format!("创建 Codex 目录失败 {}：{error}", codex_home.display()).into()
+    })?;
     let _operation_lock = acquire_operation_lock(codex_home)?;
     recover_pending_transaction_locked(codex_home)
 }
@@ -164,14 +166,18 @@ fn apply_provider_config_with_hook<F>(
 where
     F: FnOnce() -> Result<(), Box<dyn Error>>,
 {
-    fs::create_dir_all(codex_home)?;
+    fs::create_dir_all(codex_home).map_err(|error| -> Box<dyn Error> {
+        format!("创建 Codex 目录失败 {}：{error}", codex_home.display()).into()
+    })?;
     let _operation_lock = acquire_operation_lock(codex_home)?;
     recover_pending_transaction_locked(codex_home)?;
     let auth_path = codex_home.join("auth.json");
     let original_auth = match fs::read(&auth_path) {
         Ok(content) => Some(content),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
+        Err(error) => {
+            return Err(format!("读取 {} 失败：{error}", auth_path.display()).into());
+        }
     };
     let config_text = original_config
         .map(std::str::from_utf8)
@@ -340,7 +346,10 @@ fn acquire_operation_lock(codex_home: &Path) -> Result<File, Box<dyn Error>> {
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&path)?;
+        .open(&path)
+        .map_err(|error| -> Box<dyn Error> {
+            format!("打开同步锁文件失败 {}：{error}", path.display()).into()
+        })?;
     file.try_lock_exclusive()
         .map_err(|error| -> Box<dyn Error> {
             format!("另一个 QuotaPlusPlus 同步正在进行，请等待其完成后重试：{error}").into()
@@ -807,7 +816,11 @@ fn assert_sqlite_writable(path: &Path) -> Result<(), Box<dyn Error>> {
         Ok(())
     })();
     result.map_err(|error| {
-        format!("state_5.sqlite 正在使用或不可写，请关闭 Codex 后重试：{error}").into()
+        format!(
+            "state_5.sqlite 正在使用或不可写，请关闭 Codex 后重试 {}：{error}",
+            path.display()
+        )
+        .into()
     })
 }
 
@@ -873,18 +886,34 @@ fn create_backup(
     target_provider: &str,
 ) -> Result<PathBuf, Box<dyn Error>> {
     let backup_root = codex_home.join(BACKUP_DIR);
-    fs::create_dir_all(&backup_root)?;
+    fs::create_dir_all(&backup_root).map_err(|error| -> Box<dyn Error> {
+        format!("创建备份目录失败 {}：{error}", backup_root.display()).into()
+    })?;
     #[cfg(unix)]
-    fs::set_permissions(&backup_root, fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(&backup_root, fs::Permissions::from_mode(0o700)).map_err(
+        |error| -> Box<dyn Error> {
+            format!("设置备份目录权限失败 {}：{error}", backup_root.display()).into()
+        },
+    )?;
     let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
     let timestamp = Local::now().format("%Y%m%d-%H%M%S-%6f").to_string();
     let name = format!("{timestamp}-{sequence}");
     let backup_dir = backup_root.join(&name);
     let staging_dir = backup_root.join(format!(".{name}-{}.tmp", std::process::id()));
     let result = (|| -> Result<(), Box<dyn Error>> {
-        fs::create_dir(&staging_dir)?;
+        fs::create_dir(&staging_dir).map_err(|error| -> Box<dyn Error> {
+            format!("创建临时备份目录失败 {}：{error}", staging_dir.display()).into()
+        })?;
         #[cfg(unix)]
-        fs::set_permissions(&staging_dir, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(&staging_dir, fs::Permissions::from_mode(0o700)).map_err(
+            |error| -> Box<dyn Error> {
+                format!(
+                    "设置临时备份目录权限失败 {}：{error}",
+                    staging_dir.display()
+                )
+                .into()
+            },
+        )?;
 
         if let Some(config) = original_config {
             write_new_file(&staging_dir.join("config.toml"), config)?;
@@ -894,7 +923,14 @@ fn create_backup(
         }
         if let Some(path) = state_db {
             let sqlite_backup = staging_dir.join("sqlite").join(STATE_DB_NAME);
-            fs::create_dir_all(sqlite_backup.parent().expect("sqlite backup parent"))?;
+            let sqlite_backup_parent = sqlite_backup.parent().expect("sqlite backup parent");
+            fs::create_dir_all(sqlite_backup_parent).map_err(|error| -> Box<dyn Error> {
+                format!(
+                    "创建 SQLite 备份目录失败 {}：{error}",
+                    sqlite_backup_parent.display()
+                )
+                .into()
+            })?;
             backup_sqlite(path, &sqlite_backup)?;
         }
 
@@ -1065,9 +1101,15 @@ fn write_new_file(path: &Path, content: &[u8]) -> Result<(), Box<dyn Error>> {
     options.create_new(true).write(true);
     #[cfg(unix)]
     options.mode(0o600);
-    let mut file = options.open(path)?;
-    file.write_all(content)?;
-    file.sync_all()?;
+    let mut file = options.open(path).map_err(|error| -> Box<dyn Error> {
+        format!("创建备份文件失败 {}：{error}", path.display()).into()
+    })?;
+    file.write_all(content).map_err(|error| -> Box<dyn Error> {
+        format!("写入备份文件失败 {}：{error}", path.display()).into()
+    })?;
+    file.sync_all().map_err(|error| -> Box<dyn Error> {
+        format!("同步备份文件失败 {}：{error}", path.display()).into()
+    })?;
     Ok(())
 }
 
@@ -1097,7 +1139,7 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<(), Box<dyn Error>> {
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    result
+    result.map_err(|error| format!("写入 {} 失败：{error}", path.display()).into())
 }
 
 #[cfg(unix)]

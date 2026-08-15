@@ -17,7 +17,7 @@ cli_auth_credentials_store = "file"
 
 [model_providers.custom]
 name = "QuotaPlusPlus"
-base_url = "https://api.example.com/v1"
+base_url = "https://api.example.com"
 wire_api = "responses"
 requires_openai_auth = true
 ```
@@ -36,7 +36,7 @@ QPP 会直接复用仍在有效期内的官方访问令牌，只在令牌接近�
 
 第一次从官方切到 API 配置时，程序会把有效的官方认证和当时的 `config.toml` 配对保存到 `~/.codex/qpp-profiles/official/`。第三方配置以当前 `config.toml` 为底稿，只改顶层提供方和 `model_providers.custom`。API Key 填过一次后，同一个 API URL 可以留空继续使用；API URL 变化时必须重新填写对应的 API Key，避免把旧地址的密钥发送给新地址。
 
-保存第三方配置前，QPP 会向对应的 `/responses` 发送不含模型和输入的空请求，检查网络、认证和端点是否可用。这个请求不会触发模型推理；完整的模型、流式响应和工具调用兼容性仍由实际请求决定。
+API URL 应填写服务商给出的原始基础地址，QPP 不会强制添加 `/v1`。保存第三方配置前，QPP 会向对应的 `/responses` 发送不含模型和输入的空请求，检查网络、认证和端点是否可用。这个请求不会触发模型推理；完整的模型、流式响应和工具调用兼容性仍由实际请求决定。
 
 进入第三方模式时，活动目录中的 `auth.json` 会切换为 API Key 格式，普通会话、归档会话和 Codex SQLite 状态数据库中的所有任务提供方会统一为 `custom`。切回官方时，程序会恢复配对的官方 `auth.json` 和 `config.toml`，并把所有任务提供方统一为 `openai`。对话正文、标题、时间和模型字段不会改动。
 
