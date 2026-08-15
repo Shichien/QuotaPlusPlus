@@ -10,7 +10,6 @@ use std::sync::{Mutex, MutexGuard, TryLockError};
 use toml_edit::{DocumentMut, Item, Table, value};
 use url::Url;
 
-mod auth_storage;
 mod oauth;
 mod operation_lock;
 mod profiles;
@@ -123,9 +122,6 @@ fn operation_error(codex_home: &Path, stage: &str, error: impl std::fmt::Display
 }
 
 fn resolve_codex_home() -> Result<PathBuf, Box<dyn Error>> {
-    if let Some(path) = std::env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path));
-    }
     let user_dirs = UserDirs::new().ok_or("未找到用户主目录")?;
     Ok(user_dirs.home_dir().join(".codex"))
 }
@@ -166,8 +162,7 @@ where
     let config_path = codex_home.join("config.toml");
     let original = read_optional_file(&config_path)?;
     let original_bytes = original.as_deref().unwrap_or_default();
-    let original_text = std::str::from_utf8(original_bytes)
-        .map_err(|error| format!("现有 config.toml 不是 UTF-8：{error}"))?;
+    let original_text = std::str::from_utf8(original_bytes)?;
     let profiles = ProfileStore::new(codex_home);
 
     if is_official_config(original_text)? {
@@ -192,8 +187,7 @@ fn switch_to_official(codex_home: &Path) -> Result<ProviderSyncReport, Box<dyn E
     let config_path = codex_home.join("config.toml");
     let original = read_optional_file(&config_path)?;
     let original_bytes = original.as_deref().unwrap_or_default();
-    let original_text = std::str::from_utf8(original_bytes)
-        .map_err(|error| format!("现有 config.toml 不是 UTF-8：{error}"))?;
+    let original_text = std::str::from_utf8(original_bytes)?;
     let active_is_official = is_official_config(original_text)?;
     let profiles = ProfileStore::new(codex_home);
     let saved_profile = profiles.load_official()?;
@@ -216,20 +210,17 @@ fn switch_to_official(codex_home: &Path) -> Result<ProviderSyncReport, Box<dyn E
         }
     };
 
-    let official_text = std::str::from_utf8(&official_config)
-        .map_err(|error| format!("官方配置快照不是 UTF-8：{error}"))?;
+    let official_text = std::str::from_utf8(&official_config)?;
     if !is_official_config(official_text)? {
         official_config = build_official_config(official_text)?.into_bytes();
     }
-    official_config = auth_storage::use_file_credentials(&official_config)?;
 
-    let discovery = auth_storage::discover_official_auth(codex_home, original_bytes)?;
     let mut candidates = Vec::new();
     if !active_is_official && let Some(profile) = saved_profile.as_ref() {
         push_unique_auth(&mut candidates, profile.auth.clone());
     }
-    for candidate in discovery.candidates {
-        push_unique_auth(&mut candidates, candidate);
+    if active_is_official && let Some(auth) = read_optional_file(&codex_home.join("auth.json"))? {
+        push_unique_auth(&mut candidates, auth);
     }
     if active_is_official && let Some(profile) = saved_profile.as_ref() {
         push_unique_auth(&mut candidates, profile.auth.clone());
@@ -237,9 +228,6 @@ fn switch_to_official(codex_home: &Path) -> Result<ProviderSyncReport, Box<dyn E
 
     let official_auth = match select_official_auth(&candidates)? {
         Some(auth) => auth,
-        None if !discovery.errors.is_empty() => {
-            return Err(discovery.errors.join("；").into());
-        }
         None => oauth::browser_login()?,
     };
 
@@ -294,15 +282,14 @@ fn capture_official_profile(
     profiles: &ProfileStore,
     config: &[u8],
 ) -> Result<(), Box<dyn Error>> {
-    let managed_config = auth_storage::use_file_credentials(config)?;
-    profiles.save_official_config(&managed_config)?;
-    let discovery = auth_storage::discover_official_auth(codex_home, config)?;
-    let fallback = discovery
-        .candidates
-        .iter()
-        .find(|candidate| oauth::inspect_auth(candidate) != LocalAuthState::Invalid)
-        .cloned();
-    let auth = match select_official_auth(&discovery.candidates) {
+    profiles.save_official_config(config)?;
+    let Some(candidate) = read_optional_file(&codex_home.join("auth.json"))? else {
+        profiles.discard_official_auth()?;
+        return Ok(());
+    };
+    let fallback =
+        (oauth::inspect_auth(&candidate) != LocalAuthState::Invalid).then(|| candidate.clone());
+    let auth = match select_official_auth(std::slice::from_ref(&candidate)) {
         Ok(Some(auth)) => auth,
         Ok(None) => {
             profiles.discard_official_auth()?;
@@ -315,7 +302,7 @@ fn capture_official_profile(
         profiles.discard_official_auth()?;
         return Ok(());
     }
-    profiles.save_official(&managed_config, &auth)
+    profiles.save_official(config, &auth)
 }
 
 fn activate_custom(
@@ -371,11 +358,8 @@ fn read_proxy_config(codex_home: &Path) -> Result<ProxyConfig, Box<dyn Error>> {
             has_api_key: false,
         });
     };
-    let content =
-        std::str::from_utf8(&content).map_err(|error| format!("第三方配置不是 UTF-8：{error}"))?;
-    let document = content
-        .parse::<DocumentMut>()
-        .map_err(|error| format!("第三方 config.toml 解析失败：{error}"))?;
+    let content = std::str::from_utf8(&content)?;
+    let document = content.parse::<DocumentMut>()?;
     let provider = custom_provider(&document);
 
     Ok(ProxyConfig {
@@ -399,8 +383,7 @@ fn read_stored_api_url(codex_home: &Path) -> Result<Option<String>, Box<dyn Erro
     let Some(content) = load_custom_source_config(codex_home)? else {
         return Ok(None);
     };
-    let text = std::str::from_utf8(&content)
-        .map_err(|error| format!("第三方 config.toml 不是 UTF-8：{error}"))?;
+    let text = std::str::from_utf8(&content)?;
     let document = parse_config(text)?;
     custom_provider(&document)
         .and_then(|provider| provider.get("base_url"))
@@ -488,7 +471,6 @@ fn validate_api_key(input: &str) -> Result<&str, Box<dyn Error>> {
 fn build_custom_config(original: &str, api_url: &str) -> Result<String, Box<dyn Error>> {
     let mut document = parse_config(original)?;
     document["model_provider"] = value(PROVIDER_ID);
-    document["cli_auth_credentials_store"] = value("file");
     if !document.contains_key("model_providers") {
         let mut providers = Table::new();
         providers.set_implicit(true);
@@ -498,7 +480,7 @@ fn build_custom_config(original: &str, api_url: &str) -> Result<String, Box<dyn 
         .as_table_mut()
         .ok_or("config.toml 中的 model_providers 不是表")?;
     let mut provider = Table::new();
-    provider["name"] = value("QuotaPlusPlus");
+    provider["name"] = value("小猪窝");
     provider["base_url"] = value(api_url);
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(true);
@@ -523,9 +505,7 @@ fn parse_config(content: &str) -> Result<DocumentMut, Box<dyn Error>> {
     if content.trim().is_empty() {
         Ok(DocumentMut::new())
     } else {
-        content
-            .parse::<DocumentMut>()
-            .map_err(|error| format!("现有 config.toml 解析失败：{error}").into())
+        Ok(content.parse::<DocumentMut>()?)
     }
 }
 
@@ -538,15 +518,13 @@ fn is_official_config(content: &str) -> Result<bool, Box<dyn Error>> {
 }
 
 fn config_has_custom_provider(content: &[u8]) -> Result<bool, Box<dyn Error>> {
-    let content =
-        std::str::from_utf8(content).map_err(|error| format!("config.toml 不是 UTF-8：{error}"))?;
+    let content = std::str::from_utf8(content)?;
     let document = parse_config(content)?;
     Ok(custom_provider(&document).is_some())
 }
 
 fn config_selects_custom(content: &[u8]) -> Result<bool, Box<dyn Error>> {
-    let content =
-        std::str::from_utf8(content).map_err(|error| format!("config.toml 不是 UTF-8：{error}"))?;
+    let content = std::str::from_utf8(content)?;
     let document = parse_config(content)?;
     Ok(document.get("model_provider").and_then(Item::as_str) == Some(PROVIDER_ID))
 }
@@ -572,10 +550,7 @@ fn verify_custom_config(config_path: &Path, auth_path: &Path) -> Result<(), Box<
                 .is_some_and(|key| !key.trim().is_empty())
     });
     let valid = document.get("model_provider").and_then(Item::as_str) == Some(PROVIDER_ID)
-        && document
-            .get("cli_auth_credentials_store")
-            .and_then(Item::as_str)
-            == Some("file")
+        && provider.get("name").and_then(Item::as_str) == Some("小猪窝")
         && provider.get("base_url").and_then(Item::as_str).is_some()
         && provider.get("wire_api").and_then(Item::as_str) == Some("responses")
         && provider.get("requires_openai_auth").and_then(Item::as_bool) == Some(true)
@@ -651,7 +626,7 @@ mod tests {
     #[test]
     fn custom_config_preserves_unmanaged_settings_and_providers() {
         let original = r#"model = "gpt-test"
-cli_auth_credentials_store = "keyring"
+approval_policy = "never"
 
 [desktop]
 localeOverride = "zh-CN"
@@ -678,13 +653,10 @@ request_max_retries = 9
             Some("Existing")
         );
         assert_eq!(document["model_provider"].as_str(), Some("custom"));
-        assert_eq!(
-            document["cli_auth_credentials_store"].as_str(),
-            Some("file")
-        );
+        assert_eq!(document["approval_policy"].as_str(), Some("never"));
         assert_eq!(
             document["model_providers"]["custom"]["name"].as_str(),
-            Some("QuotaPlusPlus")
+            Some("小猪窝")
         );
         assert_eq!(
             document["model_providers"]["custom"]["base_url"].as_str(),
@@ -701,7 +673,7 @@ request_max_retries = 9
     fn official_and_custom_round_trip_restores_exact_active_files() {
         let directory = tempdir().expect("tempdir");
         let codex_home = directory.path();
-        let official_config = b"model = \"gpt-official\"\ncli_auth_credentials_store = \"file\"\n[desktop]\nlocaleOverride = \"zh-CN\"\n";
+        let official_config = b"model = \"gpt-official\"\n[desktop]\nlocaleOverride = \"zh-CN\"\n";
         let official_auth =
             b"{\"auth_mode\":\"chatgpt\",\"tokens\":{\"refresh_token\":\"sensitive-refresh-token\"}}";
         fs::write(codex_home.join("config.toml"), official_config).expect("write config");
@@ -744,10 +716,7 @@ request_max_retries = 9
             fs::read_to_string(codex_home.join("config.toml")).expect("read active custom config");
         let active_custom_document =
             parse_config(&active_custom_config).expect("parse custom config");
-        assert_eq!(
-            active_custom_document["cli_auth_credentials_store"].as_str(),
-            Some("file")
-        );
+        assert!(!active_custom_document.contains_key("cli_auth_credentials_store"));
         let backup = Path::new(&custom_report.backup_path);
         assert_eq!(
             fs::read(backup.join("auth.json")).expect("backup auth"),

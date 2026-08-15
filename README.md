@@ -13,10 +13,9 @@ API 配置会写入独立的 `custom` 提供方：
 
 ```toml
 model_provider = "custom"
-cli_auth_credentials_store = "file"
 
 [model_providers.custom]
-name = "QuotaPlusPlus"
+name = "小猪窝"
 base_url = "https://api.example.com"
 wire_api = "responses"
 requires_openai_auth = true
@@ -30,7 +29,7 @@ API Key 不写入 `config.toml`。第三方模式使用 Codex 标准的 `auth.js
 }
 ```
 
-第三方模式会把 `cli_auth_credentials_store` 设为 `file`，确保 macOS 也把活动 API Key 保存在 `~/.codex/auth.json`，而不是转存到系统钥匙串。首次接管时，QPP 会同时检查现有 `auth.json`、系统钥匙串、Codex 加密认证存储和已经保存的官方快照；活动 `auth.json` 即使已经是第三方 API Key，也不会阻止 QPP 继续发现其他位置的官方凭据。接管官方会话后会把官方凭据存储统一为 `file`，保证后续恢复的是同一份最新认证。模型、桌面、插件、MCP、通知和其他用户设置保持不变。
+QPP 只使用用户主目录下 `~/.codex/config.toml` 和 `~/.codex/auth.json` 作为活动配置与认证来源，不读取系统钥匙串、Codex 加密认证存储或其他目录。切换时不会添加或改写 `cli_auth_credentials_store`。模型、桌面、插件、MCP、通知和其他用户设置保持不变。
 
 QPP 会直接复用仍在有效期内的官方访问令牌，只在令牌接近过期时刷新。只有刷新令牌明确过期、被使用或被撤销时才会打开官方登录；临时网络错误和令牌服务的未知错误不会被当成退出登录。
 
@@ -38,7 +37,7 @@ QPP 会直接复用仍在有效期内的官方访问令牌，只在令牌接近�
 
 API URL 应填写服务商给出的原始基础地址，QPP 不会强制添加 `/v1`。保存第三方配置前，QPP 会向对应的 `/responses` 发送不含模型和输入的空请求，检查网络、认证和端点是否可用。这个请求不会触发模型推理；完整的模型、流式响应和工具调用兼容性仍由实际请求决定。
 
-进入第三方模式时，活动目录中的 `auth.json` 会切换为 API Key 格式，普通会话、归档会话和 Codex SQLite 状态数据库中的所有任务提供方会统一为 `custom`。切回官方时，程序会恢复配对的官方 `auth.json` 和 `config.toml`，并把所有任务提供方统一为 `openai`。对话正文、标题、时间和模型字段不会改动。
+进入第三方模式时，活动目录中的 `auth.json` 会切换为 API Key 格式，普通会话、归档会话和 Codex SQLite 状态数据库中的所有任务提供方会统一为 `custom`。SQLite 只检查 `~/.codex/sqlite/state_5.sqlite` 和旧位置 `~/.codex/state_5.sqlite`；两个数据库同时存在时，会根据会话数量、任务数量和更新时间选择当前实际使用的数据库。切回官方时，程序会恢复配对的官方 `auth.json` 和 `config.toml`，并把所有任务提供方统一为 `openai`。对话正文、标题、时间和模型字段不会改动。
 
 每次切换前的活动配置、登录文件、rollout 元数据和 SQLite 会备份到 `~/.codex/qpp-backups/`，只保留最新十份完整备份。配置、登录文件、rollout 和 SQLite 属于同一次持久化事务；普通错误会立即恢复，进程被强制结束或设备断电时会在下次启动继续恢复。执行切换前需要退出 Codex，以免 SQLite 正在被占用。
 

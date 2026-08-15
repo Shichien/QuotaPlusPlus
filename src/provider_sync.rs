@@ -6,15 +6,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-use toml_edit::{DocumentMut, Item};
+use std::time::{Duration, SystemTime};
 
 const BACKUP_DIR: &str = "qpp-backups";
 const TRANSACTION_FILE: &str = "qpp-sync-transaction.json";
@@ -47,6 +45,16 @@ struct RolloutChange {
     separator: String,
     updated_first_line: String,
     original_provider: String,
+}
+
+#[derive(Debug)]
+struct StateDbCandidateStats {
+    path: PathBuf,
+    priority: usize,
+    thread_count: i64,
+    max_thread_timestamp_ms: i64,
+    modified_at: SystemTime,
+    rollout_distance: i64,
 }
 
 #[derive(Serialize)]
@@ -179,14 +187,8 @@ where
             return Err(format!("读取 {} 失败：{error}", auth_path.display()).into());
         }
     };
-    let config_text = original_config
-        .map(std::str::from_utf8)
-        .transpose()
-        .map_err(|error| format!("现有 config.toml 不是 UTF-8：{error}"))?
-        .unwrap_or_default();
-
     let changes = collect_rollout_changes(codex_home, target_provider)?;
-    let state_db = resolve_state_db(codex_home, config_text)?;
+    let state_db = resolve_state_db(codex_home)?;
     if let Some(path) = state_db.as_deref() {
         assert_sqlite_writable(path)?;
     }
@@ -589,13 +591,6 @@ fn collect_rollout_paths(root: &Path, paths: &mut Vec<PathBuf>) -> Result<(), Bo
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            return Err(format!(
-                "会话目录包含符号链接，已停止以避免改写意外路径：{}",
-                entry.path().display()
-            )
-            .into());
-        }
         if file_type.is_dir() {
             collect_rollout_paths(&entry.path(), paths)?;
         } else if file_type.is_file() {
@@ -670,98 +665,107 @@ fn rewrite_first_line(
     write_result
 }
 
-fn resolve_state_db(
-    codex_home: &Path,
-    config_text: &str,
-) -> Result<Option<PathBuf>, Box<dyn Error>> {
-    resolve_state_db_with(
-        codex_home,
-        config_text,
-        std::env::var_os("CODEX_SQLITE_HOME"),
-        &std::env::current_dir()?,
-    )
-}
-
-fn resolve_state_db_with(
-    codex_home: &Path,
-    config_text: &str,
-    environment_sqlite_home: Option<OsString>,
-    cwd: &Path,
-) -> Result<Option<PathBuf>, Box<dyn Error>> {
-    let configured = if config_text.trim().is_empty() {
-        None
-    } else {
-        let document = config_text
-            .parse::<DocumentMut>()
-            .map_err(|error| format!("现有 config.toml 解析失败：{error}"))?;
-        document
-            .get("sqlite_home")
-            .and_then(Item::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_string)
-    };
-    let explicit = configured
-        .map(OsString::from)
-        .or(environment_sqlite_home.filter(|value| !value.is_empty()));
-    if let Some(value) = explicit {
-        let raw = PathBuf::from(value);
-        let sqlite_home = if raw.is_absolute() {
-            raw
-        } else {
-            cwd.join(raw)
-        };
-        reject_wsl_unc_on_windows(&sqlite_home)?;
-        let database = sqlite_home.join(STATE_DB_NAME);
-        if !database.is_file() {
-            return Err(format!(
-                "配置的 SQLite 目录中不存在 {}：{}",
-                STATE_DB_NAME,
-                sqlite_home.display()
-            )
-            .into());
-        }
-        reject_symlink(&database)?;
-        return Ok(Some(database));
-    }
-
-    for database in [
+fn resolve_state_db(codex_home: &Path) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    let existing = [
         codex_home.join("sqlite").join(STATE_DB_NAME),
         codex_home.join(STATE_DB_NAME),
+    ]
+    .into_iter()
+    .enumerate()
+    .filter(|(_, path)| path.is_file())
+    .collect::<Vec<_>>();
+    if existing.len() <= 1 {
+        return Ok(existing.into_iter().next().map(|(_, path)| path));
+    }
+
+    let rollout_count = count_rollout_files(codex_home)? as i64;
+    let mut readable = existing
+        .iter()
+        .filter_map(|(priority, path)| {
+            read_state_db_candidate_stats(path, *priority, rollout_count).ok()
+        })
+        .collect::<Vec<_>>();
+    if readable.is_empty() {
+        return Ok(existing.into_iter().next().map(|(_, path)| path));
+    }
+
+    readable.sort_by(|left, right| {
+        left.rollout_distance
+            .cmp(&right.rollout_distance)
+            .then_with(|| right.thread_count.cmp(&left.thread_count))
+            .then_with(|| {
+                right
+                    .max_thread_timestamp_ms
+                    .cmp(&left.max_thread_timestamp_ms)
+            })
+            .then_with(|| right.modified_at.cmp(&left.modified_at))
+            .then_with(|| left.priority.cmp(&right.priority))
+    });
+    Ok(readable.into_iter().next().map(|candidate| candidate.path))
+}
+
+fn count_rollout_files(codex_home: &Path) -> Result<usize, Box<dyn Error>> {
+    let mut paths = Vec::new();
+    for directory in SESSION_DIRS {
+        collect_rollout_paths(&codex_home.join(directory), &mut paths)?;
+    }
+    Ok(paths.len())
+}
+
+fn read_state_db_candidate_stats(
+    path: &Path,
+    priority: usize,
+    rollout_count: i64,
+) -> Result<StateDbCandidateStats, Box<dyn Error>> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let thread_count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))?;
+    let rollout_distance = if rollout_count == 0 {
+        0
+    } else {
+        (thread_count - rollout_count).abs()
+    };
+    Ok(StateDbCandidateStats {
+        path: path.to_path_buf(),
+        priority,
+        thread_count,
+        max_thread_timestamp_ms: max_thread_timestamp_ms(&connection)?,
+        modified_at: fs::metadata(path)?.modified()?,
+        rollout_distance,
+    })
+}
+
+fn max_thread_timestamp_ms(connection: &Connection) -> Result<i64, Box<dyn Error>> {
+    for (column, multiplier) in [
+        ("updated_at_ms", 1),
+        ("updated_at", 1000),
+        ("created_at_ms", 1),
+        ("created_at", 1000),
     ] {
-        if database.is_file() {
-            reject_symlink(&database)?;
-            return Ok(Some(database));
+        if table_has_column(connection, column)? {
+            let timestamp: i64 = connection.query_row(
+                &format!("SELECT COALESCE(MAX({column}), 0) FROM threads"),
+                [],
+                |row| row.get(0),
+            )?;
+            return Ok(timestamp.saturating_mul(multiplier));
         }
     }
-    Ok(None)
+    Ok(0)
 }
 
-fn reject_symlink(path: &Path) -> Result<(), Box<dyn Error>> {
-    if fs::symlink_metadata(path)?.file_type().is_symlink() {
-        return Err(format!(
-            "状态数据库是符号链接，已停止以避免改写意外路径：{}",
-            path.display()
-        )
-        .into());
+fn table_has_column(connection: &Connection, column: &str) -> Result<bool, Box<dyn Error>> {
+    let mut statement = connection.prepare("PRAGMA table_info(threads)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for candidate in columns {
+        if candidate? == column {
+            return Ok(true);
+        }
     }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn reject_wsl_unc_on_windows(path: &Path) -> Result<(), Box<dyn Error>> {
-    let normalized = path
-        .to_string_lossy()
-        .replace('/', "\\")
-        .to_ascii_lowercase();
-    if normalized.starts_with("\\\\wsl.localhost\\") || normalized.starts_with("\\\\wsl$\\") {
-        return Err(format!("Windows 不能安全改写 WSL 中的 SQLite：{}", path.display()).into());
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn reject_wsl_unc_on_windows(_path: &Path) -> Result<(), Box<dyn Error>> {
-    Ok(())
+    Ok(false)
 }
 
 fn open_state_db(path: &Path) -> Result<Connection, Box<dyn Error>> {
@@ -770,27 +774,7 @@ fn open_state_db(path: &Path) -> Result<Connection, Box<dyn Error>> {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     connection.busy_timeout(Duration::from_secs(2))?;
-    ensure_threads_provider_column(&connection)?;
     Ok(connection)
-}
-
-fn ensure_threads_provider_column(connection: &Connection) -> Result<(), Box<dyn Error>> {
-    let table_exists: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='threads')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !table_exists {
-        return Err("state_5.sqlite 缺少 threads 表".into());
-    }
-    let mut statement = connection.prepare("PRAGMA table_info(threads)")?;
-    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
-    for column in columns {
-        if column? == "model_provider" {
-            return Ok(());
-        }
-    }
-    Err("state_5.sqlite 的 threads 表缺少 model_provider 字段".into())
 }
 
 fn read_sqlite_provider_counts(path: &Path) -> Result<BTreeMap<String, usize>, Box<dyn Error>> {
@@ -979,9 +963,6 @@ fn prune_backups(codex_home: &Path, preserve: &Path) -> Result<(), Box<dyn Error
         let entry = entry?;
         let path = entry.path();
         let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            return Err(format!("备份目录包含符号链接：{}", path.display()).into());
-        }
         if !file_type.is_dir() || path == preserve {
             continue;
         }
@@ -1475,17 +1456,55 @@ mod tests {
     }
 
     #[test]
-    fn explicit_sqlite_home_does_not_fall_back() {
+    fn stale_sqlite_directory_database_yields_to_matching_legacy_database() {
         let directory = tempdir().expect("tempdir");
-        let fallback = directory.path().join("sqlite/state_5.sqlite");
-        create_state_db(&fallback, &[Some("openai")]);
-        let missing = directory.path().join("configured");
-        let config = format!("sqlite_home = {:?}\n", missing.to_string_lossy());
+        let codex_home = directory.path();
+        let sqlite_directory_db = codex_home.join("sqlite/state_5.sqlite");
+        let legacy_db = codex_home.join("state_5.sqlite");
+        create_state_db(&sqlite_directory_db, &[Some("openai")]);
+        create_state_db(
+            &legacy_db,
+            &[Some("openai"), Some("openai"), Some("openai")],
+        );
+        create_rollout(
+            &codex_home.join("sessions/rollout-one.jsonl"),
+            Some("openai"),
+            r#"{"type":"event_msg","payload":{"message":"one"}}"#,
+        );
+        create_rollout(
+            &codex_home.join("sessions/rollout-two.jsonl"),
+            Some("openai"),
+            r#"{"type":"event_msg","payload":{"message":"two"}}"#,
+        );
+        create_rollout(
+            &codex_home.join("archived_sessions/rollout-three.jsonl"),
+            Some("openai"),
+            r#"{"type":"event_msg","payload":{"message":"three"}}"#,
+        );
 
-        let error = resolve_state_db_with(directory.path(), &config, None, directory.path())
-            .expect_err("missing configured db should fail");
+        assert_eq!(
+            resolve_state_db(codex_home).expect("resolve state db"),
+            Some(legacy_db.clone())
+        );
+        apply_provider_config(codex_home, None, b"model_provider = \"custom\"\n", "custom")
+            .expect("sync selected database");
 
-        assert!(error.to_string().contains("不存在"));
+        let stale_provider: String = Connection::open(&sqlite_directory_db)
+            .expect("open stale db")
+            .query_row("SELECT model_provider FROM threads LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .expect("read stale provider");
+        let active_remaining: i64 = Connection::open(&legacy_db)
+            .expect("open active db")
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE model_provider <> 'custom'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read active providers");
+        assert_eq!(stale_provider, "openai");
+        assert_eq!(active_remaining, 0);
     }
 
     #[test]

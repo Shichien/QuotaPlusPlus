@@ -190,9 +190,6 @@ fn prune_generations(generations: &Path, current: &Path) -> Result<(), Box<dyn E
             continue;
         }
         let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            return Err(format!("快照代次目录包含符号链接：{}", path.display()).into());
-        }
         if file_type.is_dir() {
             fs::remove_dir_all(path)?;
         } else {
