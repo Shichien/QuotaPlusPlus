@@ -1,5 +1,6 @@
 const invoke = window.__TAURI__.core.invoke;
 const loginButton = document.querySelector("#login-button");
+const loginLabel = document.querySelector("#login-label");
 const configButton = document.querySelector("#config-button");
 const dialog = document.querySelector("#config-dialog");
 const form = document.querySelector("#config-form");
@@ -10,6 +11,8 @@ const revealKey = document.querySelector("#reveal-key");
 const saveButton = document.querySelector("#save-button");
 const toast = document.querySelector("#toast");
 let toastTimer;
+let loginInProgress = false;
+let cancelInProgress = false;
 
 function showToast(message, isError = false) {
   clearTimeout(toastTimer);
@@ -24,16 +27,37 @@ function errorMessage(error) {
 }
 
 loginButton.addEventListener("click", async () => {
-  loginButton.disabled = true;
+  if (loginInProgress) {
+    if (cancelInProgress) return;
+    cancelInProgress = true;
+    loginButton.disabled = true;
+    loginLabel.textContent = "正在取消";
+    try {
+      await invoke("cancel_official_login");
+    } catch (error) {
+      cancelInProgress = false;
+      loginButton.disabled = false;
+      loginLabel.textContent = "取消登录";
+      showToast(errorMessage(error), true);
+    }
+    return;
+  }
+
+  loginInProgress = true;
+  loginLabel.textContent = "取消登录";
   configButton.disabled = true;
   try {
     const result = await invoke("start_official_login");
     showToast(`已切换官方登录，已统一 ${result.rolloutFilesUpdated} 个会话文件`);
   } catch (error) {
-    showToast(errorMessage(error), true);
+    const message = errorMessage(error);
+    showToast(message, message !== "官方登录已取消");
   } finally {
+    loginInProgress = false;
+    cancelInProgress = false;
     loginButton.disabled = false;
     configButton.disabled = false;
+    loginLabel.textContent = "官方登录";
   }
 });
 

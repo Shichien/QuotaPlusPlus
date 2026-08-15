@@ -33,7 +33,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             load_proxy_config,
             save_proxy_config,
-            start_official_login
+            start_official_login,
+            cancel_official_login
         ])
         .run(tauri::generate_context!())
         .expect("failed to run QuotaPlusPlus");
@@ -58,6 +59,7 @@ async fn save_proxy_config(api_url: String, api_key: String) -> Result<ProviderS
 
 #[tauri::command]
 async fn start_official_login() -> Result<ProviderSyncReport, String> {
+    oauth::begin_login();
     let codex_home = resolve_codex_home().map_err(display_error)?;
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = acquire_app_operation().map_err(display_error)?;
@@ -65,6 +67,11 @@ async fn start_official_login() -> Result<ProviderSyncReport, String> {
     })
     .await
     .map_err(|error| format!("官方登录任务异常结束：{error}"))?
+}
+
+#[tauri::command]
+fn cancel_official_login() {
+    oauth::cancel_login();
 }
 
 fn acquire_app_operation() -> Result<MutexGuard<'static, ()>, Box<dyn Error>> {
@@ -124,6 +131,7 @@ fn install_proxy(
 }
 
 fn switch_to_official(codex_home: &Path) -> Result<ProviderSyncReport, Box<dyn Error>> {
+    oauth::ensure_login_active()?;
     fs::create_dir_all(codex_home)?;
     let config_path = codex_home.join("config.toml");
     let original = read_optional_file(&config_path)?;
@@ -166,6 +174,7 @@ fn switch_to_official(codex_home: &Path) -> Result<ProviderSyncReport, Box<dyn E
         None => oauth::browser_login()?,
     };
 
+    oauth::ensure_login_active()?;
     profiles.save_official(&official_config, &official_auth)?;
     activate_official(
         codex_home,

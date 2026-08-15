@@ -8,6 +8,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::error::Error;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tiny_http::{Request, Response, Server, StatusCode as TinyStatusCode};
 use url::Url;
@@ -16,7 +17,9 @@ const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const ISSUER: &str = "https://auth.openai.com";
 const CALLBACK_PORTS: [u16; 2] = [1455, 1457];
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const CALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+static LOGIN_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, PartialEq)]
 pub enum AuthHealth {
@@ -48,26 +51,89 @@ pub fn refresh_auth(auth: &[u8]) -> Result<AuthHealth, Box<dyn Error>> {
     refresh_auth_with(&client, &format!("{ISSUER}/oauth/token"), auth)
 }
 
+pub fn begin_login() {
+    LOGIN_CANCELLED.store(false, Ordering::SeqCst);
+}
+
+pub fn cancel_login() {
+    LOGIN_CANCELLED.store(true, Ordering::SeqCst);
+}
+
+pub fn ensure_login_active() -> Result<(), Box<dyn Error>> {
+    ensure_not_cancelled(&LOGIN_CANCELLED)
+}
+
 pub fn browser_login() -> Result<Vec<u8>, Box<dyn Error>> {
+    ensure_login_active()?;
     let (server, port) = bind_callback_server()?;
     let redirect_uri = format!("http://localhost:{port}/auth/callback");
     let pkce = generate_pkce();
     let state = random_urlsafe(32);
     let auth_url = build_authorize_url(&redirect_uri, &pkce.challenge, &state)?;
 
+    ensure_login_active()?;
     webbrowser::open(auth_url.as_str()).map_err(|error| format!("打开登录页面失败：{error}"))?;
 
-    let deadline = Instant::now() + LOGIN_TIMEOUT;
+    let (request, code) =
+        wait_for_authorization_code(&server, &state, LOGIN_TIMEOUT, &LOGIN_CANCELLED)?;
+    if let Err(error) = ensure_login_active() {
+        respond(request, 409, "Sign-in cancelled. Return to QuotaPlusPlus.")?;
+        return Err(error);
+    }
+
+    let client = http_client()?;
+    let result = exchange_code(
+        &client,
+        &format!("{ISSUER}/oauth/token"),
+        &redirect_uri,
+        &pkce.verifier,
+        &code,
+    );
+    match result {
+        Ok(auth) => {
+            if let Err(error) = ensure_login_active() {
+                respond(request, 409, "Sign-in cancelled. Return to QuotaPlusPlus.")?;
+                return Err(error);
+            }
+            respond(request, 200, "Sign-in complete. You can close this page.")?;
+            Ok(auth)
+        }
+        Err(error) => {
+            respond(
+                request,
+                502,
+                "Token exchange failed. Return to QuotaPlusPlus.",
+            )?;
+            Err(error)
+        }
+    }
+}
+
+fn wait_for_authorization_code(
+    server: &Server,
+    expected_state: &str,
+    timeout: Duration,
+    cancelled: &AtomicBool,
+) -> Result<(Request, String), Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
     loop {
+        ensure_not_cancelled(cancelled)?;
         let now = Instant::now();
         if now >= deadline {
             return Err("官方登录等待超时，请重新点击官方登录".into());
         }
-        let wait = (deadline - now).min(Duration::from_millis(500));
-        let Some(request) = server.recv_timeout(wait)? else {
+        let wait = (deadline - now).min(CALLBACK_POLL_INTERVAL);
+        let request = server.recv_timeout(wait)?;
+        if cancelled.load(Ordering::SeqCst) {
+            if let Some(request) = request {
+                respond(request, 409, "Sign-in cancelled. Return to QuotaPlusPlus.")?;
+            }
+            return Err("官方登录已取消".into());
+        }
+        let Some(request) = request else {
             continue;
         };
-        let callback = parse_callback(request.url(), &state);
+        let callback = parse_callback(request.url(), expected_state);
         match callback {
             Callback::StateMismatch => {
                 respond(request, 400, "Invalid OAuth state")?;
@@ -80,31 +146,17 @@ pub fn browser_login() -> Result<Vec<u8>, Box<dyn Error>> {
                 return Err(format!("官方登录未完成：{reason}").into());
             }
             Callback::Code(code) => {
-                let client = http_client()?;
-                let result = exchange_code(
-                    &client,
-                    &format!("{ISSUER}/oauth/token"),
-                    &redirect_uri,
-                    &pkce.verifier,
-                    &code,
-                );
-                match result {
-                    Ok(auth) => {
-                        respond(request, 200, "Sign-in complete. You can close this page.")?;
-                        return Ok(auth);
-                    }
-                    Err(error) => {
-                        respond(
-                            request,
-                            502,
-                            "Token exchange failed. Return to QuotaPlusPlus.",
-                        )?;
-                        return Err(error);
-                    }
-                }
+                return Ok((request, code));
             }
         }
     }
+}
+
+fn ensure_not_cancelled(cancelled: &AtomicBool) -> Result<(), Box<dyn Error>> {
+    if cancelled.load(Ordering::SeqCst) {
+        return Err("官方登录已取消".into());
+    }
+    Ok(())
 }
 
 fn http_client() -> Result<Client, Box<dyn Error>> {
@@ -385,6 +437,7 @@ fn respond(request: Request, status: u16, body: &str) -> Result<(), Box<dyn Erro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::thread;
 
     fn jwt(account_id: &str) -> String {
@@ -636,5 +689,29 @@ mod tests {
             parse_callback("/auth/callback?code=one&state=fixture-state", "fixture-state"),
             Callback::Code(code) if code == "one"
         ));
+    }
+
+    #[test]
+    fn callback_wait_stops_within_one_poll_after_cancellation() {
+        let server = Server::http("127.0.0.1:0").expect("bind callback server");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let trigger = Arc::clone(&cancelled);
+        let cancel_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            trigger.store(true, Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let error = wait_for_authorization_code(
+            &server,
+            "fixture-state",
+            Duration::from_secs(5),
+            cancelled.as_ref(),
+        )
+        .expect_err("cancel callback wait");
+
+        cancel_thread.join().expect("join cancellation thread");
+        assert_eq!(error.to_string(), "官方登录已取消");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

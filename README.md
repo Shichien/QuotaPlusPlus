@@ -7,7 +7,7 @@ QuotaPlusPlus 是一个面向 Codex 的极简桌面配置工具，运行命令�
 - 官方登录：切换到已经保存的 ChatGPT 官方登录；登录缺失或失效时，由 QuotaPlusPlus 打开浏览器完成官方 OAuth；
 - API 配置：填写 Responses API 的 API URL 和 API Key。
 
-QuotaPlusPlus 不会运行 `codex login`。如果当前官方登录有效，程序会通过刷新令牌测活并保存最新令牌；如果刷新令牌已失效，点击官方登录后才会打开浏览器。OAuth 使用 PKCE、本地一次性 `state` 校验以及 `localhost:1455` 或 `localhost:1457` 回调。
+QuotaPlusPlus 不会运行 `codex login`。如果当前官方登录有效，程序会通过刷新令牌测活并保存最新令牌；如果刷新令牌已失效，点击官方登录后才会打开浏览器。OAuth 使用 PKCE、本地一次性 `state` 校验以及 `localhost:1455` 或 `localhost:1457` 回调。登录等待期间，同一个入口会显示取消登录；浏览器被关闭或不再继续登录时，点击它即可立即返回，不会改动当前配置和对话数据。
 
 API 配置会写入独立的 `custom` 提供方：
 
