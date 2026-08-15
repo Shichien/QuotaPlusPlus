@@ -1,7 +1,7 @@
 cask "qpp" do
   arch arm: "arm64", intel: "x64"
 
-  version "0.3.3"
+  version "0.3.4"
   sha256 :no_check
 
   url "https://github.com/Shichien/QuotaPlusPlus/releases/download/v#{version}/qpp-macos-#{arch}.dmg",

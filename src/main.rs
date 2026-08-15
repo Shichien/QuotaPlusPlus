@@ -146,7 +146,7 @@ fn switch_to_official(codex_home: &Path) -> Result<ProviderSyncReport, Box<dyn E
 
     if !active_is_official {
         profiles.save_custom_config(original_bytes)?;
-        if let Some(auth) = read_custom_auth_for_profile(codex_home, original_bytes)? {
+        if let Some(auth) = read_custom_auth_for_profile(codex_home)? {
             profiles.save_custom_auth(&auth)?;
         }
     }
@@ -278,16 +278,10 @@ fn read_proxy_config(codex_home: &Path) -> Result<ProxyConfig, Box<dyn Error>> {
 }
 
 fn read_stored_api_key(codex_home: &Path) -> Result<Option<String>, Box<dyn Error>> {
-    if let Some(auth) = load_custom_auth(codex_home)?
-        && let Some(key) = api_key_from_auth(&auth)?
-    {
-        return Ok(Some(key));
-    }
-
-    let Some(content) = load_custom_source_config(codex_home)? else {
+    let Some(auth) = load_custom_auth(codex_home)? else {
         return Ok(None);
     };
-    read_legacy_api_key_from_config(&content)
+    api_key_from_auth(&auth)
 }
 
 fn load_custom_auth(codex_home: &Path) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
@@ -306,13 +300,6 @@ fn api_key_from_auth(auth: &[u8]) -> Result<Option<String>, Box<dyn Error>> {
         Ok(Value::Object(document)) => Value::Object(document),
         _ => return Ok(None),
     };
-    if document
-        .get("auth_mode")
-        .and_then(Value::as_str)
-        .is_some_and(|mode| mode != "apikey")
-    {
-        return Ok(None);
-    }
     Ok(document
         .get("OPENAI_API_KEY")
         .and_then(Value::as_str)
@@ -321,35 +308,13 @@ fn api_key_from_auth(auth: &[u8]) -> Result<Option<String>, Box<dyn Error>> {
         .map(str::to_string))
 }
 
-fn read_legacy_api_key_from_config(config: &[u8]) -> Result<Option<String>, Box<dyn Error>> {
-    let content =
-        std::str::from_utf8(config).map_err(|error| format!("第三方配置不是 UTF-8：{error}"))?;
-    let document = parse_config(content)?;
-    Ok(custom_provider(&document)
-        .and_then(|provider| {
-            provider
-                .iter()
-                .find(|(key, item)| is_bearer_token_field(key) && item.as_str().is_some())
-                .and_then(|(_, item)| item.as_str())
-        })
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .map(str::to_string))
-}
-
-fn read_custom_auth_for_profile(
-    codex_home: &Path,
-    active_config: &[u8],
-) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+fn read_custom_auth_for_profile(codex_home: &Path) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
     if let Some(auth) = read_optional_file(&codex_home.join("auth.json"))?
         && api_key_from_auth(&auth)?.is_some()
     {
         return Ok(Some(auth));
     }
-    let Some(key) = read_legacy_api_key_from_config(active_config)? else {
-        return Ok(None);
-    };
-    Ok(Some(build_custom_auth(&key)?))
+    Ok(None)
 }
 
 fn load_custom_source_config(codex_home: &Path) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
@@ -403,46 +368,14 @@ fn build_custom_config(original: &str, api_url: &str) -> Result<String, Box<dyn 
     let providers = document["model_providers"]
         .as_table_mut()
         .ok_or("config.toml 中的 model_providers 不是表")?;
-    if !providers.contains_key(PROVIDER_ID) {
-        providers[PROVIDER_ID] = Item::Table(Table::new());
-    }
-    let provider = providers[PROVIDER_ID]
-        .as_table_mut()
-        .ok_or("config.toml 中的 model_providers.custom 不是表")?;
+    let mut provider = Table::new();
     provider["name"] = value("QuotaPlusPlus");
     provider["base_url"] = value(api_url);
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(true);
     provider["supports_websockets"] = value(false);
-    let credential_keys = provider
-        .iter()
-        .map(|(key, _)| key.to_string())
-        .filter(|key| is_provider_credential_field(key))
-        .collect::<Vec<_>>();
-    for key in credential_keys {
-        provider.remove(&key);
-    }
+    providers[PROVIDER_ID] = Item::Table(provider);
     Ok(document.to_string())
-}
-
-fn is_provider_credential_field(key: &str) -> bool {
-    let normalized = normalize_config_key(key);
-    matches!(
-        normalized.as_str(),
-        "envkey" | "envkeyinstructions" | "auth" | "aws"
-    ) || is_bearer_token_field(key)
-}
-
-fn is_bearer_token_field(key: &str) -> bool {
-    let normalized = normalize_config_key(key);
-    normalized.contains("bearer") && normalized.contains("token")
-}
-
-fn normalize_config_key(key: &str) -> String {
-    key.chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
 }
 
 fn build_custom_auth(api_key: &str) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -514,9 +447,6 @@ fn verify_custom_config(config_path: &Path, auth_path: &Path) -> Result<(), Box<
         && provider.get("base_url").and_then(Item::as_str).is_some()
         && provider.get("wire_api").and_then(Item::as_str) == Some("responses")
         && provider.get("requires_openai_auth").and_then(Item::as_bool) == Some(true)
-        && !provider
-            .iter()
-            .any(|(key, _)| is_provider_credential_field(key))
         && auth_has_only_api_key;
     if !valid {
         return Err("配置写入后的验证未通过".into());
@@ -550,10 +480,9 @@ name = "Existing"
 base_url = "https://existing.example"
 
 [model_providers.custom]
+name = "Old Custom"
+base_url = "https://old.example/v1"
 request_max_retries = 9
-experimental_bearer_token = "legacy-one"
-experimetal_bearer_token = "legacy-two"
-env_key = "LEGACY_API_KEY"
 "#;
         let updated =
             build_custom_config(original, "https://proxy.example/v1").expect("build config");
@@ -568,17 +497,18 @@ env_key = "LEGACY_API_KEY"
             Some("Existing")
         );
         assert_eq!(document["model_provider"].as_str(), Some("custom"));
-        let custom_provider = document["model_providers"]["custom"]
-            .as_table()
-            .expect("custom provider table");
-        assert!(
-            !custom_provider
-                .iter()
-                .any(|(key, _)| is_provider_credential_field(key))
+        assert_eq!(
+            document["model_providers"]["custom"]["name"].as_str(),
+            Some("QuotaPlusPlus")
         );
         assert_eq!(
-            document["model_providers"]["custom"]["request_max_retries"].as_integer(),
-            Some(9)
+            document["model_providers"]["custom"]["base_url"].as_str(),
+            Some("https://proxy.example/v1")
+        );
+        assert!(
+            document["model_providers"]["custom"]
+                .get("request_max_retries")
+                .is_none()
         );
     }
 
@@ -677,7 +607,7 @@ env_key = "LEGACY_API_KEY"
         let directory = tempdir().expect("tempdir");
         fs::write(
             directory.path().join("config.toml"),
-            "model = \"official\"\n[model_providers.custom]\nbase_url = \"https://stale.example/v1\"\nexperimental_bearer_token = \"stale-key\"\n",
+            "model = \"official\"\n[model_providers.custom]\nbase_url = \"https://stale.example/v1\"\n",
         )
         .expect("write official config");
         let custom = build_custom_config("model = \"custom\"\n", "https://proxy.example/v1")
@@ -697,36 +627,6 @@ env_key = "LEGACY_API_KEY"
             read_stored_api_key(directory.path()).expect("read stored key"),
             Some("fixture-key".to_string())
         );
-    }
-
-    #[test]
-    fn migrates_legacy_bearer_key_into_custom_auth_profile() {
-        let directory = tempdir().expect("tempdir");
-        let codex_home = directory.path();
-        let legacy = "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"Legacy\"\nbase_url = \"https://proxy.example/v1\"\nexperimetal_bearer_token = \"legacy-key\"\n";
-        fs::write(codex_home.join("config.toml"), legacy).expect("write legacy config");
-        assert_eq!(
-            read_stored_api_key(codex_home).expect("read legacy key"),
-            Some("legacy-key".to_string())
-        );
-        let migrated = build_custom_auth(
-            &read_stored_api_key(codex_home)
-                .expect("read key")
-                .expect("legacy key"),
-        )
-        .expect("build migrated auth");
-        ProfileStore::new(codex_home)
-            .save_custom_auth(&migrated)
-            .expect("save migrated auth");
-        let auth: Value = serde_json::from_slice(
-            &ProfileStore::new(codex_home)
-                .load_custom_auth()
-                .expect("load migrated auth")
-                .expect("migrated auth"),
-        )
-        .expect("parse migrated auth");
-        assert_eq!(auth.as_object().expect("auth object").len(), 1);
-        assert_eq!(auth["OPENAI_API_KEY"], "legacy-key");
     }
 
     #[test]
@@ -753,7 +653,6 @@ env_key = "LEGACY_API_KEY"
 
         let config = fs::read_to_string(codex_home.join("config.toml")).expect("read config");
         assert!(config.contains("model_provider = \"custom\""));
-        assert!(!config.contains("bearer_token"));
         let auth: Value =
             serde_json::from_slice(&fs::read(codex_home.join("auth.json")).expect("read auth"))
                 .expect("parse auth");
@@ -762,30 +661,25 @@ env_key = "LEGACY_API_KEY"
     }
 
     #[test]
-    fn install_proxy_migrates_legacy_bearer_field_when_key_input_is_empty() {
+    fn install_proxy_reuses_saved_custom_auth_when_key_input_is_empty() {
         let directory = tempdir().expect("tempdir");
         let codex_home = directory.path();
-        fs::write(
-            codex_home.join("config.toml"),
-            "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://old.example/v1\"\nexperimetal_bearer_token = \"legacy-key\"\n",
-        )
-        .expect("write legacy config");
+        fs::write(codex_home.join("config.toml"), "model = \"gpt-official\"\n")
+            .expect("write official config");
+        ProfileStore::new(codex_home)
+            .save_custom_auth(&build_custom_auth("saved-key").expect("build custom auth"))
+            .expect("save custom auth");
 
         install_proxy(codex_home, "https://proxy.example/v1", "")
-            .expect("migrate legacy proxy config");
+            .expect("install proxy with saved key");
 
         let config = fs::read_to_string(codex_home.join("config.toml")).expect("read config");
-        let document = parse_config(&config).expect("parse migrated config");
-        let provider = custom_provider(&document).expect("custom provider");
-        assert!(
-            !provider
-                .iter()
-                .any(|(key, _)| is_provider_credential_field(key))
-        );
+        let document = parse_config(&config).expect("parse custom config");
+        assert_eq!(document["model_provider"].as_str(), Some("custom"));
         let auth: Value =
             serde_json::from_slice(&fs::read(codex_home.join("auth.json")).expect("read auth"))
                 .expect("parse auth");
-        assert_eq!(auth, json!({"OPENAI_API_KEY": "legacy-key"}));
+        assert_eq!(auth, json!({"OPENAI_API_KEY": "saved-key"}));
     }
 
     #[test]
