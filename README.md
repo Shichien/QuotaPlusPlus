@@ -90,11 +90,11 @@ brew update && brew upgrade --cask shichien/qpp/qpp
 brew uninstall --cask shichien/qpp/qpp
 ```
 
-也可以手动下载 `qpp-macos-arm64.dmg` 或 `qpp-macos-x64.dmg`，打开后把 QuotaPlusPlus 拖入应用程序目录。
+Homebrew 安装完成后会自动清除 macOS 为未签名应用添加的隔离属性。也可以手动下载 `qpp-macos-arm64.dmg` 或 `qpp-macos-x64.dmg`，打开后把 QuotaPlusPlus 拖入应用程序目录。
 
-当前发布包没有使用 Apple 开发者证书签名。首次启动时，需要在访达中右键点击 QuotaPlusPlus 并选择打开。
+当前发布包没有使用 Apple 开发者证书签名。手动安装后首次启动时，需要在访达中右键点击 QuotaPlusPlus 并选择打开。
 
-遇到 macOS 阻止启动时，可以执行：
+手动安装遇到 macOS 阻止启动时，可以执行：
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/QuotaPlusPlus.app

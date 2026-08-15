@@ -13,8 +13,8 @@ cask "qpp" do
   app "QuotaPlusPlus.app"
   binary "#{appdir}/QuotaPlusPlus.app/Contents/MacOS/qpp"
 
-  caveats <<~EOS
-    The current macOS build is unsigned. If macOS blocks the first launch, run:
-      xattr -dr com.apple.quarantine "#{appdir}/QuotaPlusPlus.app"
-  EOS
+  postflight do
+    system_command "/usr/bin/xattr",
+                   args: ["-dr", "com.apple.quarantine", "#{appdir}/QuotaPlusPlus.app"]
+  end
 end
