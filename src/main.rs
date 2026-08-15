@@ -17,7 +17,7 @@ mod profiles;
 mod provider_sync;
 mod proxy_probe;
 
-use oauth::AuthHealth;
+use oauth::{AuthHealth, LocalAuthState};
 use profiles::ProfileStore;
 use provider_sync::{AuthUpdate, ProviderSyncReport};
 
@@ -171,6 +171,7 @@ fn switch_to_official(codex_home: &Path) -> Result<ProviderSyncReport, Box<dyn E
         .map_err(|error| format!("现有 config.toml 不是 UTF-8：{error}"))?;
     let active_is_official = is_official_config(original_text)?;
     let profiles = ProfileStore::new(codex_home);
+    let saved_profile = profiles.load_official()?;
 
     if !active_is_official {
         profiles.save_custom_config(original_bytes)?;
@@ -179,19 +180,15 @@ fn switch_to_official(codex_home: &Path) -> Result<ProviderSyncReport, Box<dyn E
         }
     }
 
-    let (candidate_auth, mut official_config) = if active_is_official {
-        (
-            auth_storage::load_official_auth(codex_home, original_bytes)?,
-            original_bytes.to_vec(),
-        )
-    } else if let Some(profile) = profiles.load_official()? {
-        (Some(profile.auth), profile.config)
+    let mut official_config = if active_is_official {
+        original_bytes.to_vec()
+    } else if let Some(profile) = saved_profile.as_ref() {
+        profile.config.clone()
     } else {
-        let config = match profiles.load_official_config()? {
+        match profiles.load_official_config()? {
             Some(config) => config,
             None => build_official_config(original_text)?.into_bytes(),
-        };
-        (None, config)
+        }
     };
 
     let official_text = std::str::from_utf8(&official_config)
@@ -201,11 +198,23 @@ fn switch_to_official(codex_home: &Path) -> Result<ProviderSyncReport, Box<dyn E
     }
     official_config = auth_storage::use_file_credentials(&official_config)?;
 
-    let official_auth = match candidate_auth {
-        Some(auth) => match oauth::refresh_auth(&auth)? {
-            AuthHealth::Valid(refreshed) => refreshed,
-            AuthHealth::Invalid => oauth::browser_login()?,
-        },
+    let discovery = auth_storage::discover_official_auth(codex_home, original_bytes)?;
+    let mut candidates = Vec::new();
+    if !active_is_official && let Some(profile) = saved_profile.as_ref() {
+        push_unique_auth(&mut candidates, profile.auth.clone());
+    }
+    for candidate in discovery.candidates {
+        push_unique_auth(&mut candidates, candidate);
+    }
+    if active_is_official && let Some(profile) = saved_profile.as_ref() {
+        push_unique_auth(&mut candidates, profile.auth.clone());
+    }
+
+    let official_auth = match select_official_auth(&candidates)? {
+        Some(auth) => auth,
+        None if !discovery.errors.is_empty() => {
+            return Err(discovery.errors.join("；").into());
+        }
         None => oauth::browser_login()?,
     };
 
@@ -219,6 +228,42 @@ fn switch_to_official(codex_home: &Path) -> Result<ProviderSyncReport, Box<dyn E
     )
 }
 
+fn push_unique_auth(candidates: &mut Vec<Vec<u8>>, candidate: Vec<u8>) {
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
+}
+
+fn select_official_auth(candidates: &[Vec<u8>]) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+    select_official_auth_with(candidates, oauth::refresh_auth)
+}
+
+fn select_official_auth_with<F>(
+    candidates: &[Vec<u8>],
+    mut refresh: F,
+) -> Result<Option<Vec<u8>>, Box<dyn Error>>
+where
+    F: FnMut(&[u8]) -> Result<AuthHealth, Box<dyn Error>>,
+{
+    if let Some(current) = candidates
+        .iter()
+        .find(|candidate| oauth::inspect_auth(candidate) == LocalAuthState::Current)
+    {
+        return Ok(Some(current.clone()));
+    }
+
+    for candidate in candidates {
+        if oauth::inspect_auth(candidate) != LocalAuthState::NeedsRefresh {
+            continue;
+        }
+        match refresh(candidate)? {
+            AuthHealth::Valid(refreshed) => return Ok(Some(refreshed)),
+            AuthHealth::Invalid => {}
+        }
+    }
+    Ok(None)
+}
+
 fn capture_official_profile(
     codex_home: &Path,
     profiles: &ProfileStore,
@@ -226,15 +271,26 @@ fn capture_official_profile(
 ) -> Result<(), Box<dyn Error>> {
     let managed_config = auth_storage::use_file_credentials(config)?;
     profiles.save_official_config(&managed_config)?;
-    let Some(auth) = auth_storage::load_official_auth(codex_home, config)? else {
+    let discovery = auth_storage::discover_official_auth(codex_home, config)?;
+    let fallback = discovery
+        .candidates
+        .iter()
+        .find(|candidate| oauth::inspect_auth(candidate) != LocalAuthState::Invalid)
+        .cloned();
+    let auth = match select_official_auth(&discovery.candidates) {
+        Ok(Some(auth)) => auth,
+        Ok(None) => {
+            profiles.discard_official_auth()?;
+            return Ok(());
+        }
+        Err(_) if fallback.is_some() => fallback.expect("checked fallback"),
+        Err(error) => return Err(error),
+    };
+    if oauth::inspect_auth(&auth) == LocalAuthState::Invalid {
         profiles.discard_official_auth()?;
         return Ok(());
-    };
-    match oauth::refresh_auth(&auth) {
-        Ok(AuthHealth::Valid(refreshed)) => profiles.save_official(&managed_config, &refreshed),
-        Ok(AuthHealth::Invalid) => profiles.discard_official_auth(),
-        Err(_) => profiles.save_official(&managed_config, &auth),
     }
+    profiles.save_official(&managed_config, &auth)
 }
 
 fn activate_custom(
@@ -516,6 +572,7 @@ fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     use serde_json::Value;
     use tempfile::tempdir;
 
@@ -525,6 +582,21 @@ mod tests {
         api_key: &str,
     ) -> Result<ProviderSyncReport, Box<dyn Error>> {
         install_proxy_with_probe(codex_home, api_url, api_key, |_, _| Ok(()))
+    }
+
+    fn official_auth(expires_at: i64, refresh_token: &str) -> Vec<u8> {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{}");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({"exp": expires_at})).expect("serialize access claims"),
+        );
+        serde_json::to_vec(&json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": format!("{header}.{payload}.signature"),
+                "refresh_token": refresh_token
+            }
+        }))
+        .expect("serialize official auth")
     }
 
     #[test]
@@ -867,5 +939,40 @@ request_max_retries = 9
         assert!(normalize_api_url("https://proxy.example/v1?x=1").is_err());
         assert!(normalize_api_url("https://user:password@proxy.example/v1").is_err());
         assert!(validate_api_key("has whitespace").is_err());
+    }
+
+    #[test]
+    fn official_selection_skips_custom_auth_and_reuses_current_token() {
+        let custom = build_custom_auth("fixture-key").expect("custom auth");
+        let official = official_auth(chrono::Utc::now().timestamp() + 60 * 60, "refresh");
+        let mut refresh_calls = 0;
+
+        let selected = select_official_auth_with(&[custom, official.clone()], |_| {
+            refresh_calls += 1;
+            Err("refresh should not run".into())
+        })
+        .expect("select current auth")
+        .expect("official auth");
+
+        assert_eq!(selected, official);
+        assert_eq!(refresh_calls, 0);
+    }
+
+    #[test]
+    fn official_selection_refreshes_only_an_expiring_candidate() {
+        let custom = build_custom_auth("fixture-key").expect("custom auth");
+        let expiring = official_auth(chrono::Utc::now().timestamp() + 60, "old-refresh");
+        let refreshed = official_auth(chrono::Utc::now().timestamp() + 60 * 60, "new-refresh");
+        let mut refresh_calls = 0;
+
+        let selected = select_official_auth_with(&[custom, expiring], |_| {
+            refresh_calls += 1;
+            Ok(AuthHealth::Valid(refreshed.clone()))
+        })
+        .expect("select refreshed auth")
+        .expect("official auth");
+
+        assert_eq!(selected, refreshed);
+        assert_eq!(refresh_calls, 1);
     }
 }

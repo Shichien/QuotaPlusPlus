@@ -27,6 +27,41 @@ enum CredentialsStoreMode {
     File,
     Keyring,
     Auto,
+    Ephemeral,
+}
+
+#[derive(Debug, Default)]
+pub struct AuthDiscovery {
+    pub candidates: Vec<Vec<u8>>,
+    pub errors: Vec<String>,
+}
+
+impl AuthDiscovery {
+    fn add_candidate(&mut self, candidate: Option<Vec<u8>>) {
+        let Some(candidate) = candidate else {
+            return;
+        };
+        if !self
+            .candidates
+            .iter()
+            .any(|existing| existing == &candidate)
+        {
+            self.candidates.push(candidate);
+        }
+    }
+
+    fn add_result(
+        &mut self,
+        source: &str,
+        result: Result<Option<Vec<u8>>, Box<dyn Error>>,
+        required: bool,
+    ) {
+        match result {
+            Ok(candidate) => self.add_candidate(candidate),
+            Err(error) if required => self.errors.push(format!("读取{source}失败：{error}")),
+            Err(_) => {}
+        }
+    }
 }
 
 trait KeyringReader {
@@ -46,12 +81,12 @@ impl KeyringReader for SystemKeyring {
     }
 }
 
-/// Reads the active official credentials using the same file/keyring/auto order as Codex.
-pub fn load_official_auth(
+/// Finds persistent Codex credentials across every backend QPP can adopt.
+pub fn discover_official_auth(
     codex_home: &Path,
     config: &[u8],
-) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
-    load_official_auth_with(codex_home, config, &SystemKeyring)
+) -> Result<AuthDiscovery, Box<dyn Error>> {
+    discover_official_auth_with(codex_home, config, &SystemKeyring)
 }
 
 /// QPP owns two file snapshots, so managed official sessions use auth.json after capture.
@@ -63,32 +98,54 @@ pub fn use_file_credentials(config: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(document.to_string().into_bytes())
 }
 
-fn load_official_auth_with(
+fn discover_official_auth_with(
     codex_home: &Path,
     config: &[u8],
     keyring: &dyn KeyringReader,
-) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+) -> Result<AuthDiscovery, Box<dyn Error>> {
     let mode = credentials_store_mode(config)?;
-    let file = || read_optional(&codex_home.join("auth.json"));
+    let encrypted_first = secret_auth_storage_enabled(config)?;
+    let direct_required = mode == CredentialsStoreMode::Keyring && !encrypted_first;
+    let encrypted_required = (mode == CredentialsStoreMode::Keyring && encrypted_first)
+        || codex_home.join("secrets").join("codex_auth.age").is_file();
+    let mut discovery = AuthDiscovery::default();
 
-    match mode {
-        CredentialsStoreMode::File => file(),
-        CredentialsStoreMode::Keyring => load_keyring_auth(codex_home, config, keyring),
-        CredentialsStoreMode::Auto => match load_keyring_auth(codex_home, config, keyring) {
-            Ok(Some(auth)) => Ok(Some(auth)),
-            Ok(None) | Err(_) => file(),
-        },
+    discovery.add_result(
+        "auth.json",
+        read_optional(&codex_home.join("auth.json")),
+        true,
+    );
+    if encrypted_first {
+        discovery.add_result(
+            "Codex 加密凭据",
+            load_encrypted_auth(codex_home, keyring),
+            encrypted_required,
+        );
+        discovery.add_result(
+            "系统钥匙串",
+            load_direct_keyring_auth(codex_home, keyring),
+            direct_required,
+        );
+    } else {
+        discovery.add_result(
+            "系统钥匙串",
+            load_direct_keyring_auth(codex_home, keyring),
+            direct_required,
+        );
+        discovery.add_result(
+            "Codex 加密凭据",
+            load_encrypted_auth(codex_home, keyring),
+            encrypted_required,
+        );
     }
+
+    Ok(discovery)
 }
 
-fn load_keyring_auth(
+fn load_direct_keyring_auth(
     codex_home: &Path,
-    config: &[u8],
     keyring: &dyn KeyringReader,
 ) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
-    if secret_auth_storage_enabled(config)? {
-        return load_encrypted_auth(codex_home, keyring);
-    }
     let account = compute_store_key(codex_home);
     Ok(keyring
         .load(KEYRING_SERVICE, &account)?
@@ -137,6 +194,7 @@ fn credentials_store_mode(config: &[u8]) -> Result<CredentialsStoreMode, Box<dyn
         "file" => Ok(CredentialsStoreMode::File),
         "keyring" => Ok(CredentialsStoreMode::Keyring),
         "auto" => Ok(CredentialsStoreMode::Auto),
+        "ephemeral" => Ok(CredentialsStoreMode::Ephemeral),
         mode => Err(format!("不支持的 cli_auth_credentials_store：{mode}").into()),
     }
 }
@@ -202,7 +260,8 @@ mod tests {
 
     #[derive(Default)]
     struct MockKeyring {
-        value: Option<String>,
+        direct_value: Option<String>,
+        secrets_value: Option<String>,
         error: bool,
         calls: RefCell<Vec<(String, String)>>,
     }
@@ -215,35 +274,39 @@ mod tests {
             if self.error {
                 return Err(io::Error::other("fixture keyring error").into());
             }
-            Ok(self.value.clone())
+            Ok(match service {
+                KEYRING_SERVICE => self.direct_value.clone(),
+                SECRETS_KEYRING_SERVICE => self.secrets_value.clone(),
+                _ => None,
+            })
         }
     }
 
     #[test]
     fn missing_file_means_no_official_login() {
         let home = tempdir().expect("tempdir");
-        let auth =
-            load_official_auth_with(home.path(), b"", &MockKeyring::default()).expect("load auth");
-        assert_eq!(auth, None);
+        let discovery = discover_official_auth_with(home.path(), b"", &MockKeyring::default())
+            .expect("discover auth");
+        assert!(discovery.candidates.is_empty());
+        assert!(discovery.errors.is_empty());
     }
 
     #[test]
     fn keyring_mode_uses_upstream_service_and_scoped_account() {
         let home = tempdir().expect("tempdir");
         let keyring = MockKeyring {
-            value: Some("{\"tokens\":{}}".to_string()),
+            direct_value: Some("{\"tokens\":{}}".to_string()),
             ..Default::default()
         };
 
-        let auth = load_official_auth_with(
+        let discovery = discover_official_auth_with(
             home.path(),
             b"cli_auth_credentials_store = \"keyring\"\n[features]\nsecret_auth_storage = false\n",
             &keyring,
         )
-        .expect("load keyring auth")
-        .expect("keyring auth");
+        .expect("discover keyring auth");
 
-        assert_eq!(auth, b"{\"tokens\":{}}");
+        assert_eq!(discovery.candidates, vec![b"{\"tokens\":{}}".to_vec()]);
         let calls = keyring.calls.borrow();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, KEYRING_SERVICE);
@@ -251,36 +314,36 @@ mod tests {
     }
 
     #[test]
-    fn auto_prefers_keyring_and_falls_back_to_file() {
+    fn auto_discovers_keyring_and_file_and_tolerates_optional_keyring_failure() {
         let home = tempdir().expect("tempdir");
         fs::write(home.path().join("auth.json"), b"file-auth").expect("write auth");
         let keyring = MockKeyring {
-            value: Some("keyring-auth".to_string()),
+            direct_value: Some("keyring-auth".to_string()),
             ..Default::default()
         };
         assert_eq!(
-            load_official_auth_with(
+            discover_official_auth_with(
                 home.path(),
                 b"cli_auth_credentials_store = \"auto\"\n[features]\nsecret_auth_storage = false\n",
                 &keyring,
             )
-            .expect("load auto"),
-            Some(b"keyring-auth".to_vec())
+            .expect("discover auto")
+            .candidates,
+            vec![b"file-auth".to_vec(), b"keyring-auth".to_vec()]
         );
 
         let failed = MockKeyring {
             error: true,
             ..Default::default()
         };
-        assert_eq!(
-            load_official_auth_with(
-                home.path(),
-                b"cli_auth_credentials_store = \"auto\"\n[features]\nsecret_auth_storage = false\n",
-                &failed,
-            )
-            .expect("load fallback"),
-            Some(b"file-auth".to_vec())
+        let discovery = discover_official_auth_with(
+            home.path(),
+            b"cli_auth_credentials_store = \"auto\"\n[features]\nsecret_auth_storage = false\n",
+            &failed,
         );
+        let discovery = discovery.expect("discover file fallback");
+        assert_eq!(discovery.candidates, vec![b"file-auth".to_vec()]);
+        assert!(discovery.errors.is_empty());
     }
 
     #[test]
@@ -319,19 +382,65 @@ mod tests {
         let ciphertext = age::encrypt(&recipient, &plaintext).expect("encrypt secrets");
         fs::write(secrets_dir.join("codex_auth.age"), ciphertext).expect("write secrets");
         let keyring = MockKeyring {
-            value: Some(passphrase.to_string()),
+            secrets_value: Some(passphrase.to_string()),
             ..Default::default()
         };
-        let auth = load_official_auth_with(
+        let discovery = discover_official_auth_with(
             home.path(),
             b"cli_auth_credentials_store = \"keyring\"\n[features]\nsecret_auth_storage = true\n",
             &keyring,
         )
-        .expect("load auth");
-        assert_eq!(auth, Some(official_auth.as_bytes().to_vec()));
+        .expect("discover auth");
+        assert_eq!(
+            discovery.candidates,
+            vec![official_auth.as_bytes().to_vec()]
+        );
         let calls = keyring.calls.borrow();
-        assert_eq!(calls.len(), 1);
+        assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].0, SECRETS_KEYRING_SERVICE);
         assert_eq!(calls[0].1, compute_secrets_key(home.path()));
+        assert_eq!(calls[1].0, KEYRING_SERVICE);
+    }
+
+    #[test]
+    fn discovery_continues_past_custom_auth_json_to_official_keyring() {
+        let home = tempdir().expect("tempdir");
+        let custom_auth = b"{\"OPENAI_API_KEY\":\"fixture-key\"}";
+        let official_auth =
+            "{\"auth_mode\":\"chatgpt\",\"tokens\":{\"refresh_token\":\"refresh\"}}";
+        fs::write(home.path().join("auth.json"), custom_auth).expect("write custom auth");
+        let keyring = MockKeyring {
+            direct_value: Some(official_auth.to_string()),
+            ..Default::default()
+        };
+
+        let discovery = discover_official_auth_with(
+            home.path(),
+            b"cli_auth_credentials_store = \"file\"\n",
+            &keyring,
+        )
+        .expect("discover credentials");
+
+        assert_eq!(
+            discovery.candidates,
+            vec![custom_auth.to_vec(), official_auth.as_bytes().to_vec()]
+        );
+        assert!(discovery.errors.is_empty());
+    }
+
+    #[test]
+    fn discovery_deduplicates_credentials_shared_by_file_and_keyring() {
+        let home = tempdir().expect("tempdir");
+        let auth = "{\"auth_mode\":\"chatgpt\",\"tokens\":{\"refresh_token\":\"refresh\"}}";
+        fs::write(home.path().join("auth.json"), auth).expect("write auth");
+        let keyring = MockKeyring {
+            direct_value: Some(auth.to_string()),
+            ..Default::default()
+        };
+
+        let discovery =
+            discover_official_auth_with(home.path(), b"", &keyring).expect("discover credentials");
+
+        assert_eq!(discovery.candidates, vec![auth.as_bytes().to_vec()]);
     }
 }

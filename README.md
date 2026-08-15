@@ -30,7 +30,9 @@ API Key 不写入 `config.toml`。第三方模式使用 Codex 标准的 `auth.js
 }
 ```
 
-第三方模式会把 `cli_auth_credentials_store` 设为 `file`，确保 macOS 也把活动 API Key 保存在 `~/.codex/auth.json`，而不是转存到系统钥匙串。QPP 能读取 Codex 的文件、系统钥匙串和加密认证存储；接管官方会话后也会把官方凭据存储统一为 `file`，保证刷新令牌轮换后恢复的是同一份最新认证。模型、桌面、插件、MCP、通知和其他用户设置保持不变。
+第三方模式会把 `cli_auth_credentials_store` 设为 `file`，确保 macOS 也把活动 API Key 保存在 `~/.codex/auth.json`，而不是转存到系统钥匙串。首次接管时，QPP 会同时检查现有 `auth.json`、系统钥匙串、Codex 加密认证存储和已经保存的官方快照；活动 `auth.json` 即使已经是第三方 API Key，也不会阻止 QPP 继续发现其他位置的官方凭据。接管官方会话后会把官方凭据存储统一为 `file`，保证后续恢复的是同一份最新认证。模型、桌面、插件、MCP、通知和其他用户设置保持不变。
+
+QPP 会直接复用仍在有效期内的官方访问令牌，只在令牌接近过期时刷新。只有刷新令牌明确过期、被使用或被撤销时才会打开官方登录；临时网络错误和令牌服务的未知错误不会被当成退出登录。
 
 第一次从官方切到 API 配置时，程序会把有效的官方认证和当时的 `config.toml` 配对保存到 `~/.codex/qpp-profiles/official/`。第三方配置以当前 `config.toml` 为底稿，只改顶层提供方和 `model_providers.custom`。API Key 填过一次后，同一个 API URL 可以留空继续使用；API URL 变化时必须重新填写对应的 API Key，避免把旧地址的密钥发送给新地址。
 

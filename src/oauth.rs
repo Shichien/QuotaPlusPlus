@@ -19,11 +19,19 @@ const CALLBACK_PORTS: [u16; 2] = [1455, 1457];
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const CALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+const ACCESS_TOKEN_REFRESH_WINDOW_MINUTES: i64 = 5;
 static LOGIN_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, PartialEq)]
 pub enum AuthHealth {
     Valid(Vec<u8>),
+    Invalid,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum LocalAuthState {
+    Current,
+    NeedsRefresh,
     Invalid,
 }
 
@@ -49,6 +57,31 @@ enum Callback {
 pub fn refresh_auth(auth: &[u8]) -> Result<AuthHealth, Box<dyn Error>> {
     let client = http_client()?;
     refresh_auth_with(&client, &format!("{ISSUER}/oauth/token"), auth)
+}
+
+pub fn inspect_auth(auth: &[u8]) -> LocalAuthState {
+    let document: Value = match serde_json::from_slice(auth) {
+        Ok(Value::Object(object)) => Value::Object(object),
+        _ => return LocalAuthState::Invalid,
+    };
+    let Some(refresh_token) = token_field(&document, "refresh_token") else {
+        return LocalAuthState::Invalid;
+    };
+    if refresh_token.trim().is_empty() {
+        return LocalAuthState::Invalid;
+    }
+    let Some(access_token) = token_field(&document, "access_token") else {
+        return LocalAuthState::NeedsRefresh;
+    };
+    let Some(expires_at) = jwt_expiration(&access_token) else {
+        return LocalAuthState::NeedsRefresh;
+    };
+    let refresh_at = Utc::now().timestamp() + ACCESS_TOKEN_REFRESH_WINDOW_MINUTES * 60;
+    if expires_at > refresh_at {
+        LocalAuthState::Current
+    } else {
+        LocalAuthState::NeedsRefresh
+    }
 }
 
 pub fn begin_login() {
@@ -194,7 +227,7 @@ fn refresh_auth_with(
     let status = response.status();
     let body = response.bytes()?;
     if !status.is_success() {
-        if matches!(status, StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED) {
+        if status == StatusCode::UNAUTHORIZED || is_permanent_refresh_failure(&body) {
             return Ok(AuthHealth::Invalid);
         }
         return Err(format!("官方登录测活失败，令牌服务返回 {status}").into());
@@ -353,6 +386,38 @@ fn account_id_from_jwt(token: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn jwt_expiration(token: &str) -> Option<i64> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
+        .ok()?;
+    serde_json::from_slice::<Value>(&bytes)
+        .ok()?
+        .get("exp")?
+        .as_i64()
+}
+
+fn is_permanent_refresh_failure(body: &[u8]) -> bool {
+    let Ok(document) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let code = document
+        .get("error")
+        .and_then(|error| match error {
+            Value::Object(object) => object.get("code").and_then(Value::as_str),
+            Value::String(code) => Some(code.as_str()),
+            _ => None,
+        })
+        .or_else(|| document.get("code").and_then(Value::as_str));
+    code.is_some_and(|code| {
+        matches!(
+            code.to_ascii_lowercase().as_str(),
+            "refresh_token_expired" | "refresh_token_reused" | "refresh_token_invalidated"
+        )
+    })
+}
+
 fn bind_callback_server() -> Result<(Server, u16), Box<dyn Error>> {
     let mut errors = Vec::new();
     for port in CALLBACK_PORTS {
@@ -447,6 +512,14 @@ mod tests {
                 "https://api.openai.com/auth": {"chatgpt_account_id": account_id}
             }))
             .expect("serialize jwt payload"),
+        );
+        format!("{header}.{payload}.signature")
+    }
+
+    fn access_jwt(expires_at: i64) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{}");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({"exp": expires_at})).expect("serialize access claims"),
         );
         format!("{header}.{payload}.signature")
     }
@@ -547,6 +620,42 @@ mod tests {
     }
 
     #[test]
+    fn current_access_token_is_reused_without_refresh() {
+        let auth = serde_json::to_vec(&json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": access_jwt(Utc::now().timestamp() + 60 * 60),
+                "refresh_token": "refresh"
+            }
+        }))
+        .expect("serialize auth");
+
+        assert_eq!(inspect_auth(&auth), LocalAuthState::Current);
+    }
+
+    #[test]
+    fn expiring_access_token_requires_refresh() {
+        let auth = serde_json::to_vec(&json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": access_jwt(Utc::now().timestamp() + 60),
+                "refresh_token": "refresh"
+            }
+        }))
+        .expect("serialize auth");
+
+        assert_eq!(inspect_auth(&auth), LocalAuthState::NeedsRefresh);
+    }
+
+    #[test]
+    fn api_key_auth_is_not_an_official_candidate() {
+        let auth =
+            serde_json::to_vec(&json!({"OPENAI_API_KEY": "fixture-key"})).expect("serialize auth");
+
+        assert_eq!(inspect_auth(&auth), LocalAuthState::Invalid);
+    }
+
+    #[test]
     fn exchanges_authorization_code_with_official_pkce_form() {
         let id_token = jwt("account-exchange");
         let (url, server) = mock_exchange_server(json!({
@@ -634,6 +743,43 @@ mod tests {
             refresh_auth_with(&client, &url, &auth).expect("classify auth"),
             AuthHealth::Invalid
         );
+        server.join().expect("join mock server");
+    }
+
+    #[test]
+    fn known_refresh_token_failure_is_permanently_invalid() {
+        let auth = serde_json::to_vec(&json!({
+            "tokens": {
+                "access_token": "access",
+                "refresh_token": "refresh"
+            }
+        }))
+        .expect("serialize auth");
+        let (url, server) =
+            mock_token_server(400, json!({"error": {"code": "refresh_token_reused"}}));
+        let client = http_client().expect("http client");
+
+        assert_eq!(
+            refresh_auth_with(&client, &url, &auth).expect("classify auth"),
+            AuthHealth::Invalid
+        );
+        server.join().expect("join mock server");
+    }
+
+    #[test]
+    fn unknown_bad_request_is_transient_instead_of_forcing_login() {
+        let auth = serde_json::to_vec(&json!({
+            "tokens": {
+                "access_token": "access",
+                "refresh_token": "refresh"
+            }
+        }))
+        .expect("serialize auth");
+        let (url, server) = mock_token_server(400, json!({"error": "temporarily_unavailable"}));
+        let client = http_client().expect("http client");
+
+        let error = refresh_auth_with(&client, &url, &auth).expect_err("transient failure");
+        assert!(error.to_string().contains("400"));
         server.join().expect("join mock server");
     }
 
