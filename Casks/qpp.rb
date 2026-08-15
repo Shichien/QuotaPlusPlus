@@ -14,7 +14,7 @@ cask "qpp" do
   binary "#{appdir}/QuotaPlusPlus.app/Contents/MacOS/qpp"
 
   caveats <<~EOS
-    The current macOS build is unsigned. Install with --no-quarantine, or
-    right-click QuotaPlusPlus in Finder and choose Open the first time.
+    The current macOS build is unsigned. If macOS blocks the first launch, run:
+      xattr -dr com.apple.quarantine "#{appdir}/QuotaPlusPlus.app"
   EOS
 end

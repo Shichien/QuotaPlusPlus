@@ -77,7 +77,7 @@ notepad install.ps1
 安装了 Homebrew 的 Mac 可以执行：
 
 ```bash
-brew tap shichien/qpp https://github.com/Shichien/QuotaPlusPlus && brew install --cask --no-quarantine shichien/qpp/qpp
+brew tap shichien/qpp https://github.com/Shichien/QuotaPlusPlus && brew install --cask shichien/qpp/qpp
 ```
 
 Homebrew 会自动选择 Apple 芯片或 Intel 成品，把 QuotaPlusPlus 安装到应用程序目录，并提供 `qpp` 命令。升级和卸载分别使用：
@@ -90,6 +90,12 @@ brew uninstall --cask shichien/qpp/qpp
 也可以手动下载 `qpp-macos-arm64.dmg` 或 `qpp-macos-x64.dmg`，打开后把 QuotaPlusPlus 拖入应用程序目录。
 
 当前发布包没有使用 Apple 开发者证书签名。首次启动时，需要在访达中右键点击 QuotaPlusPlus 并选择打开。
+
+遇到 macOS 阻止启动时，可以执行：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/QuotaPlusPlus.app
+```
 
 ### Linux
 
