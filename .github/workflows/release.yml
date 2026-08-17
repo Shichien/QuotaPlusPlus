@@ -1,166 +1,99 @@
-name: Build and release QuotaPlusPlus
+name: Release
 
 on:
-  workflow_dispatch:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: windows-latest
-            artifact: qpp-windows-x64
-            target: ""
-            tauri_args: ""
-          - platform: macos-15-intel
-            artifact: qpp-macos-x64
-            target: x86_64-apple-darwin
-            tauri_args: --target x86_64-apple-darwin --bundles dmg
-          - platform: macos-14
-            artifact: qpp-macos-arm64
-            target: aarch64-apple-darwin
-            tauri_args: --target aarch64-apple-darwin --bundles dmg
-          - platform: ubuntu-22.04
-            artifact: qpp-linux-x64
-            target: ""
-            tauri_args: --bundles appimage,deb
+          - name: Windows x64
+            os: windows-2022
+            rust_target: ""
+            args: --bundles nsis,msi
+          - name: Windows ARM64
+            os: windows-11-arm
+            rust_target: aarch64-pc-windows-msvc
+            args: --target aarch64-pc-windows-msvc --bundles msi
+          - name: macOS universal
+            os: macos-14
+            rust_target: universal-apple-darwin
+            args: --target universal-apple-darwin --bundles app,dmg
+          - name: Linux x64
+            os: ubuntu-22.04
+            rust_target: ""
+            args: --bundles appimage,deb
+          - name: Linux ARM64
+            os: ubuntu-22.04-arm
+            rust_target: ""
+            args: --bundles appimage,deb
 
-    runs-on: ${{ matrix.platform }}
+    env:
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
-      - name: Install Linux desktop dependencies
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Add Rust target
+        if: matrix.rust_target != '' && matrix.rust_target != 'universal-apple-darwin'
+        run: rustup target add ${{ matrix.rust_target }}
+
+      - name: Add macOS targets
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add aarch64-apple-darwin
+          rustup target add x86_64-apple-darwin
+
+      - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
-            librsvg2-dev \
-            patchelf \
-            xdg-utils
+            build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev patchelf
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - name: Import Apple certificate
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
+        uses: apple-actions/import-codesign-certs@v3
         with:
-          targets: ${{ matrix.target }}
+          p12-file-base64: ${{ env.APPLE_CERTIFICATE }}
+          p12-password: ${{ env.APPLE_CERTIFICATE_PASSWORD }}
 
-      - name: Run tests
-        run: cargo test --locked
+      - run: pnpm install --frozen-lockfile
 
-      - name: Build Windows executable
-        if: runner.os == 'Windows'
-        run: cargo build --release --locked
-
-      - name: Build macOS and Linux bundles
-        if: runner.os != 'Windows'
-        uses: tauri-apps/tauri-action@v1
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          args: ${{ matrix.tauri_args }}
-          retryAttempts: 2
-
-      - name: Verify macOS bundle layout
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          dmg="$(find "target/${{ matrix.target }}/release/bundle/dmg" -name '*.dmg' -print -quit)"
-          test -n "$dmg"
-          mount_dir="$(mktemp -d)"
-          cleanup() {
-            hdiutil detach "$mount_dir" >/dev/null 2>&1 || true
-            rmdir "$mount_dir" >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
-          hdiutil attach "$dmg" -mountpoint "$mount_dir" -nobrowse -readonly
-          test -d "$mount_dir/QuotaPlusPlus.app"
-          test -x "$mount_dir/QuotaPlusPlus.app/Contents/MacOS/qpp"
-
-      - name: Prepare Windows release assets
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path 'release-assets' -Force | Out-Null
-          Copy-Item -LiteralPath 'target/release/qpp.exe' -Destination 'release-assets/qpp-windows-x64.exe'
-          $repository = '${{ github.repository }}'
-          $install = (Get-Content -LiteralPath 'scripts/install.ps1' -Raw).Replace('__QPP_REPOSITORY__', $repository)
-          Set-Content -LiteralPath 'release-assets/install.ps1' -Value $install -Encoding utf8NoBOM -NoNewline
-          Copy-Item -LiteralPath 'scripts/uninstall.ps1' -Destination 'release-assets/uninstall.ps1'
-
-      - name: Prepare Intel macOS release asset
-        if: matrix.artifact == 'qpp-macos-x64'
-        run: |
-          mkdir -p release-assets
-          cp target/x86_64-apple-darwin/release/bundle/dmg/*.dmg release-assets/qpp-macos-x64.dmg
-
-      - name: Prepare Apple silicon macOS release asset
-        if: matrix.artifact == 'qpp-macos-arm64'
-        run: |
-          mkdir -p release-assets
-          cp target/aarch64-apple-darwin/release/bundle/dmg/*.dmg release-assets/qpp-macos-arm64.dmg
-
-      - name: Prepare Linux release assets
-        if: runner.os == 'Linux'
-        run: |
-          mkdir -p release-assets
-          cp target/release/bundle/appimage/*.AppImage release-assets/qpp-linux-x64.AppImage
-          cp target/release/bundle/deb/*.deb release-assets/qpp-linux-x64.deb
-
-      - name: Upload platform assets
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: release-assets/*
-          if-no-files-found: error
-
-  release:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download platform assets
-        uses: actions/download-artifact@v4
-        with:
-          path: release-assets
-          merge-multiple: true
-
-      - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: release-assets/*
-          fail_on_unmatched_files: true
-          generate_release_notes: true
-
-  verify-macos-install:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: release
-    strategy:
-      fail-fast: false
-      matrix:
-        platform:
-          - macos-14
-          - macos-15-intel
-
-    runs-on: ${{ matrix.platform }}
-
-    steps:
-      - name: Install from the Homebrew tap
-        run: |
-          brew tap shichien/qpp "https://github.com/${{ github.repository }}"
-          brew install --cask shichien/qpp/qpp
-
-      - name: Verify the installed application
-        run: |
-          test -d /Applications/QuotaPlusPlus.app
-          test -x /Applications/QuotaPlusPlus.app/Contents/MacOS/qpp
-          if xattr -p com.apple.quarantine /Applications/QuotaPlusPlus.app >/dev/null 2>&1; then
-            echo "QuotaPlusPlus.app still has the quarantine attribute" >&2
-            exit 1
-          fi
+          tagName: v__VERSION__
+          releaseName: CSwitch v__VERSION__
+          releaseBody: CSwitch v__VERSION__
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
